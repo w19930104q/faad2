@@ -339,52 +339,349 @@ static int FindAdtsSRIndex(int sr)
         if (sr == adts_sample_rates[i])
             return i;
     }
-    return 16 - 1;
+    /* 15 (0xF) is the "escape" index and must never be returned. */
+    return -1;
 }
 
-static unsigned char *MakeAdtsHeader(int *dataSize, NeAACDecFrameInfo *hInfo, unsigned char old_format)
+/*
+ * Derive the 3-bit ADTS channel_configuration (ISO/IEC 14496-3 Table 1.17)
+ * from the actual loudspeaker positions of the decoded frame. Matching on
+ * positions (not merely on the channel count) ensures that genuinely
+ * non-standard, program_config_element defined layouts correctly fall back
+ * to 0 (which mandates an in-band PCE) instead of being mislabelled.
+ *
+ *   1: C                       2: L R
+ *   3: C L R                   4: C L R BC
+ *   5: C L R BL BR             6: C L R BL BR LFE
+ *   7: C L R SL SR BL BR LFE
+ */
+static int FindAdtsChannelConfig(NeAACDecFrameInfo *hInfo)
+{
+    int n, i;
+    int has_c = 0, has_fl = 0, has_fr = 0, has_bc = 0, has_lfe = 0;
+    int surround = 0;  /* any of SIDE_L/R, BACK_L/R */
+    int known = 1;     /* all positions are among the standard speaker IDs */
+
+    n = (int)hInfo->channels;
+    if (n <= 0 || n > 64)
+        return 0;
+
+    for (i = 0; i < n; i++)
+    {
+        switch (hInfo->channel_position[i])
+        {
+        case FRONT_CHANNEL_CENTER: has_c = 1; break;
+        case FRONT_CHANNEL_LEFT:   has_fl = 1; break;
+        case FRONT_CHANNEL_RIGHT:  has_fr = 1; break;
+        case BACK_CHANNEL_CENTER:  has_bc = 1; break;
+        case LFE_CHANNEL:          has_lfe = 1; break;
+        case SIDE_CHANNEL_LEFT:
+        case SIDE_CHANNEL_RIGHT:
+        case BACK_CHANNEL_LEFT:
+        case BACK_CHANNEL_RIGHT:   surround++; break;
+        case UNKNOWN_CHANNEL:
+        default:
+            known = 0;
+            break;
+        }
+    }
+
+    /* An unrecognized speaker layout must use channel_configuration 0 and an
+     * in-band program_config_element; it cannot be labelled with a standard
+     * configuration number. */
+    if (!known)
+        return 0;
+
+    /* Match ISO/IEC 14496-3 Table 1.17. The standard predates the side/back
+     * surround distinction, so either placement counts as a surround speaker,
+     * and PCE-derived streams may not distinguish LFE from a surround element
+     * in channel_position[]. For each channel count there is only one standard
+     * configuration, so a complete set of known positions maps directly. */
+    switch (n)
+    {
+    case 1:
+        return (has_c || surround == 0) ? 1 : 0;
+    case 2:
+        return (has_fl && has_fr) ? 2 : 0;
+    case 3:
+        return (has_c && has_fl && has_fr) ? 3 : 0;
+    case 4:
+        return (has_c && has_fl && has_fr && has_bc) ? 4 : 0;
+    case 5:
+        /* C L R + two surround speakers */
+        return (has_c && has_fl && has_fr &&
+                (surround + has_lfe) == 2) ? 5 : 0;
+    case 6:
+        /* 5.1: C L R + two surround speakers + LFE (only standard 6-ch layout) */
+        return (has_c && has_fl && has_fr &&
+                (surround + has_lfe) == 3) ? 6 : 0;
+    case 8:
+        /* 7.1: C L R + four surround speakers + LFE */
+        return (has_c && has_fl && has_fr &&
+                (surround + has_lfe) == 5) ? 7 : 0;
+    default:
+        return 0;
+    }
+}
+
+/* Close an ADTS output file, flushing first so buffered write errors
+ * (e.g. disk full) are reported instead of silently truncating the stream. */
+static void close_adts_file(FILE *adtsFile)
+{
+    if (fflush(adtsFile) != 0)
+        faad_fprintf(stderr, "Error flushing ADTS output file\n");
+    if (fclose(adtsFile) != 0)
+        faad_fprintf(stderr, "Error closing ADTS output file\n");
+}
+
+/* Minimal MSB-first bit writer used to (re)serialise a program_config_element.
+ * A PCE is at most a handful of bytes (16 elements x 5 bits plus fixed fields),
+ * so a fixed 64-byte scratch buffer is always sufficient. */
+#define ADTS_PCE_MAX_BYTES 64
+typedef struct
+{
+    unsigned char buf[ADTS_PCE_MAX_BYTES];
+    int bitpos;
+} pce_bitwriter;
+
+static void pce_put(pce_bitwriter *w, unsigned int value, int nbits)
+{
+    int i;
+    for (i = nbits - 1; i >= 0; i--)
+    {
+        int byteidx = w->bitpos >> 3;
+        if (byteidx >= ADTS_PCE_MAX_BYTES)
+            return;
+        if ((value >> i) & 1u)
+            w->buf[byteidx] |= (unsigned char)(1u << (7 - (w->bitpos & 7)));
+        w->bitpos++;
+    }
+}
+
+/* ISO/IEC 14496-3 byte_alignment(): emit a marker 1 bit, then zero bits up to
+ * the next byte boundary. */
+static void pce_byte_align(pce_bitwriter *w)
+{
+    if (w->bitpos & 7)
+    {
+        pce_put(w, 1, 1);
+        while (w->bitpos & 7)
+            pce_put(w, 0, 1);
+    }
+}
+
+/*
+ * Serialise the program_config_element described by hInfo into the front of
+ * out (which must have room for ADTS_PCE_MAX_BYTES). Returns the number of
+ * bytes written, or 0 if no PCE is present / it cannot be represented.
+ *
+ * The decoder consumes the in-band PCE while decoding (ISO/IEC 14496-4), so the
+ * ADTS writer has to reconstruct it from the element lists exposed in hInfo.
+ * Writing the element instance tags verbatim is what lets a standalone parser
+ * (another player) allocate the channel elements in their actual, possibly
+ * non-canonical order.
+ */
+static int BuildProgramConfigElement(unsigned char *out, NeAACDecFrameInfo *hInfo)
+{
+    pce_bitwriter w;
+    int i;
+    unsigned char profile;
+    int sr_index;
+
+    if (out == NULL || hInfo == NULL || hInfo->pce_set == 0)
+        return 0;
+    if (hInfo->pce_num_front > 16 || hInfo->pce_num_side > 16 ||
+        hInfo->pce_num_back > 16 || hInfo->pce_num_lfe > 16 ||
+        hInfo->pce_num_front == 0)
+        return 0;
+
+    memset(w.buf, 0, sizeof(w.buf));
+    w.bitpos = 0;
+
+    /* object_type / sampling_frequency_index: prefer the values carried by the
+     * original PCE, falling back to the frame's own signalling. */
+    profile = hInfo->pce_object_type ? hInfo->pce_object_type
+                                     : hInfo->object_type;
+    if (hInfo->pce_sf_index < 15)
+    {
+        sr_index = hInfo->pce_sf_index;
+    } else {
+        if ((hInfo->sbr == SBR_UPSAMPLED) || (hInfo->sbr == NO_SBR_UPSAMPLED))
+            sr_index = FindAdtsSRIndex((int)(hInfo->samplerate / 2));
+        else
+            sr_index = FindAdtsSRIndex((int)hInfo->samplerate);
+        if (sr_index < 0)
+            return 0;
+    }
+
+    pce_put(&w, 5, 3);                 /* element_id = ID_PCE */
+    pce_put(&w, 0, 4);                 /* element_instance_tag */
+    pce_put(&w, profile & 0x3, 2);     /* object_type (2-bit profile) */
+    pce_put(&w, (unsigned int)sr_index & 0xF, 4);
+
+    pce_put(&w, hInfo->pce_num_front, 4);
+    pce_put(&w, hInfo->pce_num_side, 4);
+    pce_put(&w, hInfo->pce_num_back, 4);
+    pce_put(&w, hInfo->pce_num_lfe, 2);
+    pce_put(&w, 0, 3);                 /* num_assoc_data_elements */
+    pce_put(&w, 0, 4);                 /* num_valid_cc_elements */
+    pce_put(&w, 0, 1);                 /* mono_mixdown_present */
+    pce_put(&w, 0, 1);                 /* stereo_mixdown_present */
+    pce_put(&w, 0, 1);                 /* matrix_mixdown_idx_present */
+
+    for (i = 0; i < hInfo->pce_num_front; i++)
+    {
+        pce_put(&w, hInfo->pce_front_is_cpe[i] & 1, 1);
+        pce_put(&w, hInfo->pce_front_tag[i] & 0xF, 4);
+    }
+    for (i = 0; i < hInfo->pce_num_side; i++)
+    {
+        pce_put(&w, hInfo->pce_side_is_cpe[i] & 1, 1);
+        pce_put(&w, hInfo->pce_side_tag[i] & 0xF, 4);
+    }
+    for (i = 0; i < hInfo->pce_num_back; i++)
+    {
+        pce_put(&w, hInfo->pce_back_is_cpe[i] & 1, 1);
+        pce_put(&w, hInfo->pce_back_tag[i] & 0xF, 4);
+    }
+    for (i = 0; i < hInfo->pce_num_lfe; i++)
+        pce_put(&w, hInfo->pce_lfe_tag[i] & 0xF, 4);
+
+    pce_byte_align(&w);
+    pce_put(&w, 0, 8);                 /* comment_field_bytes = 0 */
+
+    if (w.bitpos & 7)
+        return 0;                      /* must end on a byte boundary */
+    {
+        int nbytes = w.bitpos >> 3;
+        if (nbytes <= 0 || nbytes > ADTS_PCE_MAX_BYTES)
+            return 0;
+        memcpy(out, w.buf, (size_t)nbytes);
+        return nbytes;
+    }
+}
+
+/*
+ * Build a 7-byte (protection absent) MPEG-4 ADTS header for one frame.
+ *
+ * The header fields must describe the frame exactly so that an independent
+ * parser (any other player) can walk the stream without the container:
+ *   - profile           : core AAC object type, HE-AAC (OT 5/29) signals its
+ *                         AAC-LC core as profile 1; SBR/PS ride in-band
+ *   - sampling freq idx : core sample rate (half the output rate for SBR)
+ *   - channel config    : program_config_element when the fixed config does
+ *                         not map to one of the standard configurations 1..7
+ *   - frame length      : header size + actual payload bytes in this frame
+ *
+ * Returns a malloc'ed header (caller frees), or NULL when the frame cannot be
+ * described by a valid ADTS header. *dataSize is set only on success.
+ */
+static unsigned char *MakeAdtsHeader(int *dataSize, NeAACDecFrameInfo *hInfo,
+                                     unsigned char old_format, int pce_stream,
+                                     int pce_len)
 {
     unsigned char *data;
-    int profile = (hInfo->object_type - 1) & 0x3;
-    int sr_index = ((hInfo->sbr == SBR_UPSAMPLED) || (hInfo->sbr == NO_SBR_UPSAMPLED)) ?
-        FindAdtsSRIndex(hInfo->samplerate / 2) : FindAdtsSRIndex(hInfo->samplerate);
+    int profile;
+    int sr_index;
+    int chan_conf;
     int skip = (old_format) ? 8 : 7;
-    int framesize = skip + hInfo->bytesconsumed;
+    int framesize;
+    unsigned long payload_size;
 
+    if (dataSize == NULL || hInfo == NULL)
+        return NULL;
+    if (pce_len < 0 || pce_len > ADTS_PCE_MAX_BYTES)
+        return NULL;
+
+    /* HE-AAC / HE-AAC v2 use an AAC-LC core in ADTS; the SBR (and PS)
+     * extension is carried in-band and must not be encoded in the 2-bit
+     * profile field (object type 5 cannot be represented there). */
+    if (hInfo->object_type == HE_AAC)
+        profile = LC - 1;
+    else
+        profile = ((int)hInfo->object_type - 1) & 0x3;
+
+    /* ADTS always carries the core (pre-SBR) sampling rate. When SBR runs in
+     * upsampled mode, hInfo->samplerate is the doubled output rate. */
+    if ((hInfo->sbr == SBR_UPSAMPLED) || (hInfo->sbr == NO_SBR_UPSAMPLED))
+        sr_index = FindAdtsSRIndex((int)(hInfo->samplerate / 2));
+    else
+        sr_index = FindAdtsSRIndex((int)hInfo->samplerate);
+    if (sr_index < 0)
+    {
+        faad_fprintf(stderr, "Error: sample rate %lu Hz cannot be signalled in ADTS\n",
+            hInfo->samplerate);
+        return NULL;
+    }
+
+    /* A program_config_element-defined layout has no fixed
+     * channel_configuration number: every frame signals 0 (the PCE itself is
+     * carried only in the first raw_data_block). For ordinary fixed layouts
+     * derive the standard 1..7 value from the loudspeaker positions. */
+    if (pce_stream)
+        chan_conf = 0;
+    else
+        chan_conf = FindAdtsChannelConfig(hInfo);
+
+    /* When the input already had an ADTS header, bytesconsumed includes that
+     * header and the caller re-emits only the payload; otherwise the whole
+     * raw frame is the payload. */
     if (hInfo->header_type == ADTS)
-        framesize -= skip;
+    {
+        if ((unsigned long)skip >= hInfo->bytesconsumed)
+            return NULL;
+        payload_size = hInfo->bytesconsumed - (unsigned long)skip;
+    } else {
+        payload_size = hInfo->bytesconsumed;
+    }
+
+    /* frame_length is a 13-bit field: 7/8 header bytes, the (re)built PCE (if
+     * any), then the raw payload. */
+    framesize = skip + pce_len + (int)payload_size;
+    if (framesize <= skip || framesize > 0x1FFF)
+    {
+        faad_fprintf(stderr, "Error: frame size %d does not fit ADTS frame_length\n",
+            framesize);
+        return NULL;
+    }
 
     *dataSize = 7;
+    data = malloc((size_t)(*dataSize) * sizeof(unsigned char));
+    if (data == NULL)
+    {
+        *dataSize = 0;
+        return NULL;
+    }
+    memset(data, 0, (size_t)(*dataSize) * sizeof(unsigned char));
 
-    data = malloc(*dataSize * sizeof(unsigned char));
-    memset(data, 0, *dataSize * sizeof(unsigned char));
+    data[0] = 0xFF; /* 8b: syncword */
 
-    data[0] += 0xFF; /* 8b: syncword */
-
-    data[1] += 0xF0; /* 4b: syncword */
-    /* 1b: mpeg id = 0 */
+    data[1] = 0xF0; /* 4b: syncword */
+    /* 1b: mpeg id = 0 (MPEG-4) */
     /* 2b: layer = 0 */
-    data[1] += 1; /* 1b: protection absent */
+    data[1] |= 1; /* 1b: protection absent = 1 */
 
-    data[2] += ((profile << 6) & 0xC0); /* 2b: profile */
-    data[2] += ((sr_index << 2) & 0x3C); /* 4b: sampling_frequency_index */
+    /* channel_configuration is a 3-bit field split across two bytes:
+     * its MSB is the low bit of data[2], its two LSBs are the top
+     * bits of data[3]. */
+    data[2] = (unsigned char)(((profile & 0x3) << 6)   /* 2b: profile */
+                            | ((sr_index & 0xF) << 2)  /* 4b: sampling_frequency_index */
+                            | ((chan_conf >> 2) & 0x1));/* 1b: channel_configuration bit 2 */
     /* 1b: private = 0 */
-    data[2] += ((hInfo->channels >> 2) & 0x1); /* 1b: channel_configuration */
 
-    data[3] += ((hInfo->channels << 6) & 0xC0); /* 2b: channel_configuration */
-    /* 1b: original */
-    /* 1b: home */
-    /* 1b: copyright_id */
-    /* 1b: copyright_id_start */
-    data[3] += ((framesize >> 11) & 0x3); /* 2b: aac_frame_length */
+    data[3] = (unsigned char)(((chan_conf & 0x3) << 6)  /* 2b: channel_configuration bits 1..0 */
+                            | ((framesize >> 11) & 0x3));/* 2b: aac_frame_length MSBs */
+    /* 1b: original_copy = 0, 1b: home = 0 */
+    /* 1b: copyright_identification_bit = 0 */
+    /* 1b: copyright_identification_start = 0 */
 
-    data[4] += ((framesize >> 3) & 0xFF); /* 8b: aac_frame_length */
+    data[4] = (unsigned char)((framesize >> 3) & 0xFF); /* 8b: aac_frame_length */
 
-    data[5] += ((framesize << 5) & 0xE0); /* 3b: aac_frame_length */
-    data[5] += ((0x7FF >> 6) & 0x1F); /* 5b: adts_buffer_fullness */
+    data[5] = (unsigned char)(((framesize & 0x7) << 5)  /* 3b: aac_frame_length LSBs */
+                            | ((0x7FF >> 6) & 0x1F));   /* 5b: adts_buffer_fullness */
 
-    data[6] += ((0x7FF << 2) & 0x3F); /* 6b: adts_buffer_fullness */
-    /* 2b: num_raw_data_blocks */
+    data[6] = (unsigned char)((0x7FF << 2) & 0x3F); /* 6b: adts_buffer_fullness */
+    /* 2b: number_of_raw_data_blocks_in_frame = 0 (one raw_data_block) */
 
     return data;
 }
@@ -457,6 +754,13 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
     FILE *adtsFile = NULL;
     unsigned char *adtsData;
     int adtsDataSize;
+
+    /* Reconstructed program_config_element, emitted once in the first output
+     * frame when the source uses channel_configuration 0. */
+    unsigned char pceBuf[ADTS_PCE_MAX_BYTES];
+    int pceLen = 0;
+    int pceEmitted = 0;
+    int pceStream = 0;   /* set once any frame is PCE-defined; all headers use chan_conf 0 */
 
     NeAACDecHandle hDecoder;
     NeAACDecFrameInfo frameInfo;
@@ -677,16 +981,67 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
         if (adts_out == 1)
         {
             int skip = (old_format) ? 8 : 7;
-            adtsData = MakeAdtsHeader(&adtsDataSize, &frameInfo, old_format);
+            size_t payload_size;
 
-            /* write the adts header */
-            fwrite(adtsData, 1, adtsDataSize, adtsFile);
+            /* Do not emit frames that failed to decode: their length and
+             * configuration cannot be trusted in an ADTS stream other
+             * players must be able to parse standalone. */
+            if (frameInfo.error != 0 || frameInfo.bytesconsumed == 0)
+            {
+                if (frameInfo.error != 0)
+                    faad_fprintf(stderr, "Error: %s; skipping frame in ADTS output\n",
+                        NeAACDecGetErrorMessage(frameInfo.error));
+            } else {
+                /* A PCE-defined layout needs the program_config_element in the
+                 * first raw_data_block only. Build it once from the decoder's
+                 * exposed element lists; later frames carry no PCE but keep
+                 * channel_configuration 0 because the program is stream-level. */
+                if (frameInfo.pce_set)
+                    pceStream = 1;
+                if (!pceEmitted)
+                {
+                    pceLen = pceStream ? BuildProgramConfigElement(pceBuf,
+                                                                    &frameInfo)
+                                       : 0;
+                    pceEmitted = 1;
+                } else {
+                    pceLen = 0;
+                }
 
-            /* write the frame data */
-            if (frameInfo.header_type == ADTS)
-                fwrite(b.buffer + skip, 1, frameInfo.bytesconsumed - skip, adtsFile);
-            else
-                fwrite(b.buffer, 1, frameInfo.bytesconsumed, adtsFile);
+                adtsData = MakeAdtsHeader(&adtsDataSize, &frameInfo, old_format,
+                                          pceStream, pceLen);
+                if (adtsData == NULL)
+                    break;
+
+                if (frameInfo.header_type == ADTS)
+                {
+                    if ((unsigned long)skip >= frameInfo.bytesconsumed)
+                    {
+                        free(adtsData);
+                        adtsData = NULL;
+                        break;
+                    }
+                    payload_size = (size_t)(frameInfo.bytesconsumed - skip);
+                } else {
+                    payload_size = (size_t)frameInfo.bytesconsumed;
+                }
+
+                /* write the adts header, optional PCE, and frame data, checking
+                 * I/O so a short write cannot produce a truncated final frame */
+                if (fwrite(adtsData, 1, adtsDataSize, adtsFile) != (size_t)adtsDataSize ||
+                    (pceLen > 0 &&
+                     fwrite(pceBuf, 1, (size_t)pceLen, adtsFile) != (size_t)pceLen) ||
+                    fwrite((frameInfo.header_type == ADTS) ? b.buffer + skip : b.buffer,
+                           1, payload_size, adtsFile) != payload_size)
+                {
+                    faad_fprintf(stderr, "Error writing ADTS output file\n");
+                    free(adtsData);
+                    adtsData = NULL;
+                    break;
+                }
+                free(adtsData);
+                adtsData = NULL;
+            }
         }
 
         /* update buffer indices */
@@ -763,7 +1118,7 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
 
     if (adts_out == 1)
     {
-        fclose(adtsFile);
+        close_adts_file(adtsFile);
     }
 
     if (b.infile != stdin)
@@ -794,6 +1149,13 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
     FILE *adtsFile = NULL;
     unsigned char *adtsData;
     int adtsDataSize;
+
+    /* Reconstructed program_config_element for channel_configuration 0
+     * streams, emitted once in the first output frame. */
+    unsigned char pceBuf[ADTS_PCE_MAX_BYTES];
+    int pceLen = 0;
+    int pceEmitted = 0;
+    int pceStream = 0;   /* set once any frame is PCE-defined; all headers use chan_conf 0 */
 
     NeAACDecHandle hDecoder;
     NeAACDecConfigurationPtr config;
@@ -955,12 +1317,52 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
 
         if (adts_out == 1)
         {
-            adtsData = MakeAdtsHeader(&adtsDataSize, &frameInfo, 0);
+            /* Only emit frames that decoded cleanly: a frame with an error
+             * has no trustworthy length or configuration and must not corrupt
+             * the independently parseable ADTS stream. */
+            if (frameInfo.error != 0 || frameInfo.bytesconsumed == 0)
+            {
+                faad_fprintf(stderr, "Error: %s; skipping frame in ADTS output\n",
+                    NeAACDecGetErrorMessage(frameInfo.error));
+                break;
+            }
 
-            /* write the adts header */
-            fwrite(adtsData, 1, adtsDataSize, adtsFile);
+            /* Build the program_config_element once for a
+             * channel_configuration 0 stream; only the first frame carries it,
+             * but every frame keeps channel_configuration 0. */
+            if (frameInfo.pce_set)
+                pceStream = 1;
+            if (!pceEmitted)
+            {
+                pceLen = pceStream ? BuildProgramConfigElement(pceBuf,
+                                                                &frameInfo)
+                                   : 0;
+                pceEmitted = 1;
+            } else {
+                pceLen = 0;
+            }
 
-            fwrite(mp4config.bitbuf.data, 1, frameInfo.bytesconsumed, adtsFile);
+            adtsData = MakeAdtsHeader(&adtsDataSize, &frameInfo, 0,
+                                      pceStream, pceLen);
+            if (adtsData == NULL)
+            {
+                break;
+            }
+
+            /* write the adts header, optional PCE, then the raw frame */
+            if (fwrite(adtsData, 1, adtsDataSize, adtsFile) != (size_t)adtsDataSize ||
+                (pceLen > 0 &&
+                 fwrite(pceBuf, 1, (size_t)pceLen, adtsFile) != (size_t)pceLen) ||
+                fwrite(mp4config.bitbuf.data, 1, frameInfo.bytesconsumed, adtsFile)
+                    != frameInfo.bytesconsumed)
+            {
+                faad_fprintf(stderr, "Error writing ADTS output file\n");
+                free(adtsData);
+                adtsData = NULL;
+                break;
+            }
+            free(adtsData);
+            adtsData = NULL;
         }
 
         /* open the sound file now that the number of channels are known */
@@ -1072,7 +1474,7 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
 
     if (adts_out == 1)
     {
-        fclose(adtsFile);
+        close_adts_file(adtsFile);
     }
 
     mp4read_close();

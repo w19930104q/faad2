@@ -197,6 +197,30 @@ typedef struct NeAACDecFrameInfo
 
     /* PS: 0: off, 1: on */
     unsigned char ps;
+
+    /* In-band program_config_element (PCE) state.
+     *
+     * pce_set is nonzero when the stream defines its channel layout through a
+     * program_config_element rather than one of the fixed channel_configuration
+     * values 1..7. An ADTS writer must then signal channel_configuration 0 and
+     * carry a PCE in the first raw_data_block. The decoder consumes the in-band
+     * PCE while decoding (per ISO/IEC 14496-4), so the element lists below expose
+     * its contents for re-serialisation. Each entry is an (is_cpe, tag) pair for
+     * the front/side/back groups; lfe_tag holds LFE element instance tags. */
+    unsigned char pce_set;
+    unsigned char pce_object_type;
+    unsigned char pce_sf_index;
+    unsigned char pce_num_front;
+    unsigned char pce_num_side;
+    unsigned char pce_num_back;
+    unsigned char pce_num_lfe;
+    unsigned char pce_front_is_cpe[16];
+    unsigned char pce_front_tag[16];
+    unsigned char pce_side_is_cpe[16];
+    unsigned char pce_side_tag[16];
+    unsigned char pce_back_is_cpe[16];
+    unsigned char pce_back_tag[16];
+    unsigned char pce_lfe_tag[16];
 } NeAACDecFrameInfo;
 
 NEAACDECAPI char* NeAACDecGetErrorMessage(unsigned char errcode);

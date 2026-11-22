@@ -592,6 +592,14 @@ static void create_channel_config(NeAACDecStruct *hDecoder, NeAACDecFrameInfo *h
     hInfo->num_lfe_channels = 0;
     memset(hInfo->channel_position, 0, MAX_CHANNELS*sizeof(uint8_t));
 
+    /* Reset the exposed program_config_element view; only populated below when
+     * the stream actually carries a PCE. */
+    hInfo->pce_set = 0;
+    hInfo->pce_num_front = 0;
+    hInfo->pce_num_side = 0;
+    hInfo->pce_num_back = 0;
+    hInfo->pce_num_lfe = 0;
+
     if (hDecoder->downMatrix)
     {
         hInfo->num_front_channels = 2;
@@ -611,6 +619,39 @@ static void create_channel_config(NeAACDecStruct *hDecoder, NeAACDecFrameInfo *h
         hInfo->num_side_channels = hDecoder->pce.num_side_channels;
         hInfo->num_back_channels = hDecoder->pce.num_back_channels;
         hInfo->num_lfe_channels = hDecoder->pce.num_lfe_channels;
+
+        /* Expose the parsed program_config_element so an ADTS writer can
+         * re-serialise it. The decoder consumes the in-band PCE, so without
+         * this copy its element tags/cpe flags would be lost and a standalone
+         * parser could not reconstruct an explicit (channel_configuration 0)
+         * layout. */
+        hInfo->pce_set = 1;
+        hInfo->pce_object_type = hDecoder->pce.object_type;
+        hInfo->pce_sf_index = hDecoder->pce.sf_index;
+        hInfo->pce_num_front = hDecoder->pce.num_front_channel_elements;
+        hInfo->pce_num_side = hDecoder->pce.num_side_channel_elements;
+        hInfo->pce_num_back = hDecoder->pce.num_back_channel_elements;
+        hInfo->pce_num_lfe = hDecoder->pce.num_lfe_channel_elements;
+        for (i = 0; i < hDecoder->pce.num_front_channel_elements; i++)
+        {
+            hInfo->pce_front_is_cpe[i] = hDecoder->pce.front_element_is_cpe[i];
+            hInfo->pce_front_tag[i] = hDecoder->pce.front_element_tag_select[i];
+        }
+        for (i = 0; i < hDecoder->pce.num_side_channel_elements; i++)
+        {
+            hInfo->pce_side_is_cpe[i] = hDecoder->pce.side_element_is_cpe[i];
+            hInfo->pce_side_tag[i] = hDecoder->pce.side_element_tag_select[i];
+        }
+        for (i = 0; i < hDecoder->pce.num_back_channel_elements; i++)
+        {
+            hInfo->pce_back_is_cpe[i] = hDecoder->pce.back_element_is_cpe[i];
+            hInfo->pce_back_tag[i] = hDecoder->pce.back_element_tag_select[i];
+        }
+        for (i = 0; i < hDecoder->pce.num_lfe_channel_elements; i++)
+        {
+            hInfo->pce_lfe_tag[i] = hDecoder->pce.lfe_element_tag_select[i];
+        }
+
         chdir = hInfo->num_front_channels;
         if (chdir & 1)
         {
