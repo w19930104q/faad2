@@ -296,3 +296,35 @@ if(NOT FAAD_BUNDLED_MODE)
     RENAME faad.1
   )
 endif()  # FAAD_BUNDLED_MODE
+
+# --- Tests -----------------------------------------------------------------
+option(FAAD_BUILD_TESTS "Build faad unit tests" ON)
+if(FAAD_BUILD_TESTS)
+  enable_testing()
+
+  # Unit tests for the frontend WAV/RAW writer; no external dependencies.
+  add_executable(audio_writer_test test/audio_test.c frontend/audio.c
+                 frontend/unicode_support.c)
+  target_include_directories(audio_writer_test PRIVATE
+    include
+    frontend
+  )
+  target_compile_definitions(audio_writer_test PRIVATE
+    ${FAAD_DEFINES}
+  )
+  if(MATH_LIBRARY)
+    target_link_libraries(audio_writer_test PRIVATE ${MATH_LIBRARY})
+  endif()
+  add_test(NAME audio_writer_test COMMAND audio_writer_test)
+
+  # End-to-end test; the script skips itself when ffmpeg/python3 are absent.
+  find_program(FFMPEG_BINARY ffmpeg)
+  find_program(PYTHON3_BINARY python3)
+  if(FFMPEG_BINARY AND PYTHON3_BINARY AND FAAD_BUILD_CLI)
+    add_test(
+      NAME wav_output_e2e
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/run_e2e.sh
+              $<TARGET_FILE:faad_cli>
+    )
+  endif()
+endif()

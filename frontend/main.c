@@ -61,7 +61,7 @@
 #define min(a,b) ( (a) < (b) ? (a) : (b) )
 #endif
 
-#define MAX_CHANNELS 6 /* make this higher to support files with
+#define MAX_CHANNELS 8 /* make this higher to support files with
                           more channels */
 
 #define MAX_PERCENTS 384
@@ -245,39 +245,6 @@ static int adts_parse(aac_buffer *b, int *bitrate, float *length)
     return 1;
 }
 
-/* MicroSoft channel definitions */
-#define SPEAKER_FRONT_LEFT             0x1
-#define SPEAKER_FRONT_RIGHT            0x2
-#define SPEAKER_FRONT_CENTER           0x4
-#define SPEAKER_LOW_FREQUENCY          0x8
-#define SPEAKER_BACK_LEFT              0x10
-#define SPEAKER_BACK_RIGHT             0x20
-#define SPEAKER_FRONT_LEFT_OF_CENTER   0x40
-#define SPEAKER_FRONT_RIGHT_OF_CENTER  0x80
-#define SPEAKER_BACK_CENTER            0x100
-#define SPEAKER_SIDE_LEFT              0x200
-#define SPEAKER_SIDE_RIGHT             0x400
-#define SPEAKER_TOP_CENTER             0x800
-#define SPEAKER_TOP_FRONT_LEFT         0x1000
-#define SPEAKER_TOP_FRONT_CENTER       0x2000
-#define SPEAKER_TOP_FRONT_RIGHT        0x4000
-#define SPEAKER_TOP_BACK_LEFT          0x8000
-#define SPEAKER_TOP_BACK_CENTER        0x10000
-#define SPEAKER_TOP_BACK_RIGHT         0x20000
-#define SPEAKER_RESERVED               0x80000000
-
-static long aacChannelConfig2wavexChannelMask(NeAACDecFrameInfo *hInfo)
-{
-    if (hInfo->channels == 6 && hInfo->num_lfe_channels)
-    {
-        return SPEAKER_FRONT_LEFT + SPEAKER_FRONT_RIGHT +
-            SPEAKER_FRONT_CENTER + SPEAKER_LOW_FREQUENCY +
-            SPEAKER_BACK_LEFT + SPEAKER_BACK_RIGHT;
-    } else {
-        return 0;
-    }
-}
-
 static char *position2string(int position)
 {
     switch (position)
@@ -302,7 +269,8 @@ static void print_channel_info(NeAACDecFrameInfo *frameInfo)
 {
     /* print some channel info */
     int i;
-    long channelMask = aacChannelConfig2wavexChannelMask(frameInfo);
+    long channelMask = faad_wave_channel_mask(frameInfo->channel_position,
+                                               frameInfo->channels);
 
     faad_fprintf(stderr, "  ---------------------\n");
     if (frameInfo->num_lfe_channels > 0)
@@ -714,10 +682,12 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
                 if (!to_stdout)
                 {
                     aufile = open_audio_file(sndfile, frameInfo.samplerate, frameInfo.channels,
-                        (int)outputFormat, fileType, aacChannelConfig2wavexChannelMask(&frameInfo));
+                        (int)outputFormat, fileType,
+                        frameInfo.channel_position);
                 } else {
                     aufile = open_audio_file("-", frameInfo.samplerate, frameInfo.channels,
-                        (int)outputFormat, fileType, aacChannelConfig2wavexChannelMask(&frameInfo));
+                        (int)outputFormat, fileType,
+                        frameInfo.channel_position);
                 }
                 if (aufile == NULL)
                 {
@@ -975,13 +945,15 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
                 if(!to_stdout)
                 {
                     aufile = open_audio_file(sndfile, frameInfo.samplerate, frameInfo.channels,
-                        (int)outputFormat, fileType, aacChannelConfig2wavexChannelMask(&frameInfo));
+                        (int)outputFormat, fileType,
+                        frameInfo.channel_position);
                 } else {
 #ifdef _WIN32
                     _setmode(_fileno(stdout), O_BINARY);
 #endif
                     aufile = open_audio_file("-", frameInfo.samplerate, frameInfo.channels,
-                        (int)outputFormat, fileType, aacChannelConfig2wavexChannelMask(&frameInfo));
+                        (int)outputFormat, fileType,
+                        frameInfo.channel_position);
                 }
                 if (aufile == NULL)
                 {

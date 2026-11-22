@@ -1,0 +1,6 @@
+work/
+work-e2e/
+samples/
+samples-e2e/
+__pycache__/
+*.pcm

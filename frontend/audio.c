@@ -34,7 +34,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <fcntl.h>
-#include <math.h>
+#include <string.h>
 #include <neaacdec.h>
 #include <stdint.h>
 
@@ -52,10 +52,102 @@ static size_t write_audio_32bit(audio_file *aufile, void *sample_buffer,
 static size_t write_audio_float(audio_file *aufile, void *sample_buffer,
                                 unsigned int samples);
 
+/* Map a decoder channel position (neaacdec.h FRONT_CHANNEL_*, ...) to the
+   corresponding Microsoft speaker bit used in dwChannelMask of a
+   WAVEFORMATEXTENSIBLE structure. Returns 0 for positions that cannot be
+   represented in a standard channel mask. */
+static long channel_position_to_speaker_bit(unsigned char position)
+{
+    switch (position)
+    {
+    case FRONT_CHANNEL_LEFT:   return 0x00001L; /* SPEAKER_FRONT_LEFT */
+    case FRONT_CHANNEL_RIGHT:  return 0x00002L; /* SPEAKER_FRONT_RIGHT */
+    case FRONT_CHANNEL_CENTER: return 0x00004L; /* SPEAKER_FRONT_CENTER */
+    case LFE_CHANNEL:          return 0x00008L; /* SPEAKER_LOW_FREQUENCY */
+    case BACK_CHANNEL_LEFT:    return 0x00010L; /* SPEAKER_BACK_LEFT */
+    case BACK_CHANNEL_RIGHT:   return 0x00020L; /* SPEAKER_BACK_RIGHT */
+    case BACK_CHANNEL_CENTER:  return 0x00100L; /* SPEAKER_BACK_CENTER */
+    case SIDE_CHANNEL_LEFT:    return 0x00200L; /* SPEAKER_SIDE_LEFT */
+    case SIDE_CHANNEL_RIGHT:   return 0x00400L; /* SPEAKER_SIDE_RIGHT */
+    default:                   return 0L;
+    }
+}
+
+long faad_wave_channel_mask(const unsigned char *channelPosition,
+                            unsigned int channels)
+{
+    unsigned int i;
+    long channelMask = 0;
+
+    /* WAVEFORMATEXTENSIBLE is only needed for multi-channel content;
+       mono and stereo keep the plain PCM header. */
+    if (channels < 3)
+        return 0;
+
+    for (i = 0; i < channels; i++)
+    {
+        long bit = channel_position_to_speaker_bit(channelPosition[i]);
+
+        /* An unknown position, or two channels claiming the same speaker,
+           cannot be described faithfully by a standard channel mask. */
+        if (bit == 0 || (channelMask & bit))
+            return 0;
+
+        channelMask |= bit;
+    }
+
+    return channelMask;
+}
+
+/* Build the channel permutation so that interleaved frames are written in
+   the speaker order defined by the channel mask (ascending speaker bit
+   order, as required by WAVEFORMATEXTENSIBLE). channelOrder[slot] is the
+   source channel index in the decoded bitstream. Falls back to the
+   identity permutation (and a zero mask) when the layout cannot be
+   represented. */
+static void build_channel_order(audio_file *aufile)
+{
+    unsigned int i;
+    unsigned long remaining;
+    unsigned int slot = 0;
+
+    for (i = 0; i < WAV_MAX_CHANNELS; i++)
+        aufile->channelOrder[i] = (unsigned char)i;
+
+    aufile->channelMask = 0;
+
+    if (aufile->fileType != OUTPUT_WAV)
+        return;
+
+    aufile->channelMask = faad_wave_channel_mask(aufile->channelPosition,
+                                                 aufile->channels);
+    if (aufile->channelMask == 0)
+        return;
+
+    /* walk the set speaker bits from low to high (mask order) */
+    remaining = (unsigned long)aufile->channelMask;
+    while (remaining)
+    {
+        unsigned long bit = remaining & (0UL - remaining);
+
+        remaining &= remaining - 1;
+        for (i = 0; i < aufile->channels; i++)
+        {
+            if ((unsigned long)channel_position_to_speaker_bit(aufile->channelPosition[i]) == bit)
+            {
+                aufile->channelOrder[slot++] = (unsigned char)i;
+                break;
+            }
+        }
+    }
+}
+
 audio_file *open_audio_file(char *infile, int samplerate, int channels,
-                            int outputFormat, int fileType, long channelMask)
+                            int outputFormat, int fileType,
+                            unsigned char *channelPosition)
 {
     audio_file *aufile = malloc(sizeof(audio_file));
+    unsigned int i;
 
     aufile->outputFormat = outputFormat;
 
@@ -63,7 +155,11 @@ audio_file *open_audio_file(char *infile, int samplerate, int channels,
     aufile->channels = channels;
     aufile->total_samples = 0;
     aufile->fileType = fileType;
-    aufile->channelMask = channelMask;
+    aufile->channelMask = 0;
+
+    for (i = 0; i < WAV_MAX_CHANNELS; i++)
+        aufile->channelPosition[i] = (i < (unsigned int)channels && channelPosition)
+            ? channelPosition[i] : UNKNOWN_CHANNEL;
 
     switch (outputFormat)
     {
@@ -99,6 +195,8 @@ audio_file *open_audio_file(char *infile, int samplerate, int channels,
         if (aufile) free(aufile);
         return NULL;
     }
+
+    build_channel_order(aufile);
 
     if (aufile->fileType == OUTPUT_WAV)
     {
@@ -311,6 +409,32 @@ static size_t write_wav_extensible_header(audio_file *aufile, long channelMask)
     return fwrite(header, sizeof(header), 1, aufile->sndfile);
 }
 
+static void reorder_channels(audio_file *aufile, void *sample_buffer,
+                             unsigned int samples, unsigned int sample_size)
+{
+    unsigned char *buf = (unsigned char *)sample_buffer;
+    unsigned int channels = aufile->channels;
+    unsigned int frames, f, slot;
+
+    if (aufile->channelMask == 0 || channels < 2)
+        return;
+
+    frames = samples / channels;
+    for (f = 0; f < frames; f++)
+    {
+        unsigned char frame[WAV_MAX_CHANNELS * 4]; /* largest sample: 32 bit */
+        unsigned char *src = buf + (size_t)f * channels * sample_size;
+
+        for (slot = 0; slot < channels; slot++)
+        {
+            memcpy(frame + (size_t)slot * sample_size,
+                   src + (size_t)aufile->channelOrder[slot] * sample_size,
+                   sample_size);
+        }
+        memcpy(src, frame, (size_t)channels * sample_size);
+    }
+}
+
 static size_t write_audio_16bit(audio_file *aufile, void *sample_buffer,
                                 unsigned int samples)
 {
@@ -321,25 +445,7 @@ static size_t write_audio_16bit(audio_file *aufile, void *sample_buffer,
 
     aufile->total_samples += samples;
 
-    if (aufile->channels == 6 && aufile->channelMask)
-    {
-        for (i = 0; i+6 <= samples; i += aufile->channels)
-        {
-            short r1, r2, r3, r4, r5, r6;
-            r1 = sample_buffer16[i];
-            r2 = sample_buffer16[i+1];
-            r3 = sample_buffer16[i+2];
-            r4 = sample_buffer16[i+3];
-            r5 = sample_buffer16[i+4];
-            r6 = sample_buffer16[i+5];
-            sample_buffer16[i] = r2;
-            sample_buffer16[i+1] = r3;
-            sample_buffer16[i+2] = r1;
-            sample_buffer16[i+3] = r6;
-            sample_buffer16[i+4] = r4;
-            sample_buffer16[i+5] = r5;
-        }
-    }
+    reorder_channels(aufile, sample_buffer, samples, sizeof(short));
 
     for (i = 0; i < samples; i++)
     {
@@ -364,25 +470,7 @@ static size_t write_audio_24bit(audio_file *aufile, void *sample_buffer,
 
     aufile->total_samples += samples;
 
-    if (aufile->channels == 6 && aufile->channelMask)
-    {
-        for (i = 0; i+6 <= samples; i += aufile->channels)
-        {
-            long r1, r2, r3, r4, r5, r6;
-            r1 = sample_buffer24[i];
-            r2 = sample_buffer24[i+1];
-            r3 = sample_buffer24[i+2];
-            r4 = sample_buffer24[i+3];
-            r5 = sample_buffer24[i+4];
-            r6 = sample_buffer24[i+5];
-            sample_buffer24[i] = r2;
-            sample_buffer24[i+1] = r3;
-            sample_buffer24[i+2] = r1;
-            sample_buffer24[i+3] = r6;
-            sample_buffer24[i+4] = r4;
-            sample_buffer24[i+5] = r5;
-        }
-    }
+    reorder_channels(aufile, sample_buffer, samples, sizeof(int32_t));
 
     for (i = 0; i < samples; i++)
     {
@@ -408,25 +496,7 @@ static size_t write_audio_32bit(audio_file *aufile, void *sample_buffer,
 
     aufile->total_samples += samples;
 
-    if (aufile->channels == 6 && aufile->channelMask)
-    {
-        for (i = 0; i+6 <= samples; i += aufile->channels)
-        {
-            long r1, r2, r3, r4, r5, r6;
-            r1 = sample_buffer32[i];
-            r2 = sample_buffer32[i+1];
-            r3 = sample_buffer32[i+2];
-            r4 = sample_buffer32[i+3];
-            r5 = sample_buffer32[i+4];
-            r6 = sample_buffer32[i+5];
-            sample_buffer32[i] = r2;
-            sample_buffer32[i+1] = r3;
-            sample_buffer32[i+2] = r1;
-            sample_buffer32[i+3] = r6;
-            sample_buffer32[i+4] = r4;
-            sample_buffer32[i+5] = r5;
-        }
-    }
+    reorder_channels(aufile, sample_buffer, samples, sizeof(int32_t));
 
     for (i = 0; i < samples; i++)
     {
@@ -453,55 +523,22 @@ static size_t write_audio_float(audio_file *aufile, void *sample_buffer,
 
     aufile->total_samples += samples;
 
-    if (aufile->channels == 6 && aufile->channelMask)
-    {
-        for (i = 0; i+6 <= samples; i += aufile->channels)
-        {
-            float r1, r2, r3, r4, r5, r6;
-            r1 = sample_buffer_f[i];
-            r2 = sample_buffer_f[i+1];
-            r3 = sample_buffer_f[i+2];
-            r4 = sample_buffer_f[i+3];
-            r5 = sample_buffer_f[i+4];
-            r6 = sample_buffer_f[i+5];
-            sample_buffer_f[i] = r2;
-            sample_buffer_f[i+1] = r3;
-            sample_buffer_f[i+2] = r1;
-            sample_buffer_f[i+3] = r6;
-            sample_buffer_f[i+4] = r4;
-            sample_buffer_f[i+5] = r5;
-        }
-    }
+    reorder_channels(aufile, sample_buffer, samples, sizeof(float));
 
     for (i = 0; i < samples; i++)
     {
-        int exponent, mantissa, negative = 0 ;
-        float in = sample_buffer_f[i];
+        /* Standard IEEE-754 binary32 bitcast; WAVE float data is little
+           endian, same as the host endianness assumed by this frontend
+           (see the PCM writers above). Preserves +/-0, inf and NaN. */
+        union { float f; uint32_t u; } cvt;
+        uint32_t bits;
 
-        data[i*4] = 0; data[i*4+1] = 0; data[i*4+2] = 0; data[i*4+3] = 0;
-        if (in == 0.0)
-            continue;
-
-        if (in < 0.0)
-        {
-            in *= -1.0;
-            negative = 1;
-        }
-        in = (float)frexp(in, &exponent);
-        exponent += 126;
-        in *= (float)0x1000000;
-        mantissa = (((int)in) & 0x7FFFFF);
-
-        if (negative)
-            data[i*4+3] |= 0x80;
-
-        if (exponent & 0x01)
-            data[i*4+2] |= 0x80;
-
-        data[i*4] = mantissa & 0xFF;
-        data[i*4+1] = (mantissa >> 8) & 0xFF;
-        data[i*4+2] |= (mantissa >> 16) & 0x7F;
-        data[i*4+3] |= (exponent >> 1) & 0x7F;
+        cvt.f = sample_buffer_f[i];
+        bits = cvt.u;
+        data[i*4]   = (char)(bits & 0xFF);
+        data[i*4+1] = (char)((bits >> 8) & 0xFF);
+        data[i*4+2] = (char)((bits >> 16) & 0xFF);
+        data[i*4+3] = (char)((bits >> 24) & 0xFF);
     }
 
     ret = fwrite(data, samples, aufile->bits_per_sample/8, aufile->sndfile);

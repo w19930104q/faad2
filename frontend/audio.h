@@ -40,6 +40,11 @@ extern "C" {
 #define OUTPUT_WAV 1
 #define OUTPUT_RAW 2
 
+/* Matches NeAACDecFrameInfo.channel_position[]; see neaacdec.h.
+   A WAVEFORMATEXTENSIBLE channel mask can only be built when every
+   output channel has one of these known positions. */
+#define WAV_MAX_CHANNELS 64
+
 typedef struct
 {
     int toStdio;
@@ -50,13 +55,29 @@ typedef struct
     unsigned int bits_per_sample;
     unsigned int channels;
     unsigned long total_samples;
+    /* Non-zero only for multi-channel WAV output that is written with a
+       WAVEFORMATEXTENSIBLE header. */
     long channelMask;
+    /* Positions of the decoded channels in the bitstream order (as
+       reported by the decoder). Only valid while opening the file. */
+    unsigned char channelPosition[WAV_MAX_CHANNELS];
+    /* Permutation table: for output slot i, source channel
+       channelOrder[i] carries the speaker identified by bit i of the
+       channel mask. Identity when no extensible header is written. */
+    unsigned char channelOrder[WAV_MAX_CHANNELS];
 } audio_file;
 
 audio_file *open_audio_file(char *infile, int samplerate, int channels,
-                            int outputFormat, int fileType, long channelMask);
+                            int outputFormat, int fileType,
+                            unsigned char *channelPosition);
 size_t write_audio_file(audio_file *aufile, void *sample_buffer, int samples);
 void close_audio_file(audio_file *aufile);
+
+/* Derive the WAVEFORMATEXTENSIBLE dwChannelMask from decoder channel
+   positions (neaacdec.h FRONT_CHANNEL_*, ...). Returns 0 when a plain
+   PCM header must be used (mono/stereo or non-representable layout). */
+long faad_wave_channel_mask(const unsigned char *channelPosition,
+                            unsigned int channels);
 
 #ifdef __cplusplus
 }
