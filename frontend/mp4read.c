@@ -203,13 +203,33 @@ static int elstin(int size)
     u8in(); u8in(); u8in();
 
     uint32_t entry_count = u32in();
-    int entry_size = (version == 1) ? 20 : 12;
+    uint32_t entry_size = (version == 1) ? 20 : 12;
     int available = size - 8;
+    uint32_t i;
 
-    /* Some tracks start with an "empty edit" (media_time == -1) used only to
-       offset the track's start for A/V sync; the real gapless priming delay
-       is carried by the first non-empty entry that follows it. */
-    while (entry_count > 0 && available >= entry_size)
+    if (available < 0)
+        return ERR_FAIL;
+
+    /* keep only whole entries actually present in the atom */
+    if (entry_count > (uint32_t)available / entry_size)
+        entry_count = (uint32_t)available / entry_size;
+
+    if (!entry_count)
+        return size;
+
+    freeMem(&mp4config.elst_entries);
+    mp4config.elst_count = 0;
+
+    mp4config.elst_entries = malloc(sizeof(elst_entry_t) * entry_count);
+    if (!mp4config.elst_entries)
+        return ERR_FAIL;
+
+    /* Store the complete edit list; it is turned into a sample timeline in
+       mp4read_open() once the sample rate and movie timescale are known.
+       Entries with media_time == -1 are "empty edits": they occupy
+       presentation time (e.g. an A/V sync offset) without referencing any
+       media. */
+    for (i = 0; i < entry_count; i++)
     {
         uint64_t segment_duration;
         int64_t media_time;
@@ -233,21 +253,11 @@ static int elstin(int size)
         u16in();
         u16in();
 
-        available -= entry_size;
-        entry_count--;
-
-        if (media_time < 0)
-            continue;
-
-        if (!mp4config.has_elst)
-        {
-            /* elst_media_time is in media (sample rate) timescale = priming delay in samples */
-            mp4config.elst_media_time = media_time;
-            mp4config.elst_segment_duration = segment_duration;
-            mp4config.has_elst = 1;
-        }
-        break;
+        mp4config.elst_entries[i].segment_duration = segment_duration;
+        mp4config.elst_entries[i].media_time = media_time;
     }
+    mp4config.elst_count = entry_count;
+    mp4config.has_elst = 1;
 
     return size;
 }
@@ -1049,9 +1059,8 @@ static int moovin(int sizemax)
         DATA("mvhd", mvhdin),
         STOP()
     };
+    /* parsed within the bounds of the selected sound track */
     static creator_t edts[] = {
-        NAME("trak"),
-        DESCENT(),
         NAME("edts"),
         DESCENT(),
         DATA("elst", elstin),
@@ -1095,12 +1104,6 @@ static int moovin(int sizemax)
 
     fseek(g_fin, apos, SEEK_SET);
 
-    g_atom = edts;
-    atomsize = sizemax + apos - ftell(g_fin);
-    parse(&atomsize); /* optional edts atom */
-
-    fseek(g_fin, apos, SEEK_SET);
-
     while (1)
     {
         //fprintf(stderr, "TRAK\n");
@@ -1112,7 +1115,22 @@ static int moovin(int sizemax)
         err = parse(&atomsize);
         //fprintf(stderr, "SIZE: %x/%x\n", atomsize, sizemax);
         if (err >= 0)
+        {
+            /* The sound track was found and parsed; on return parse() leaves
+               the file positioned at the end of the track atom and atomsize
+               holds its size. Now look for an edit list inside this track
+               (edit lists of other tracks, e.g. video, must not be applied
+               to the audio timeline). */
+            long trakend = ftell(g_fin);
+            long trakstart = trakend - atomsize;
+            uint32_t edtssize;
+
+            fseek(g_fin, trakstart + 8, SEEK_SET);
+            g_atom = edts;
+            edtssize = atomsize - 8;
+            parse(&edtssize); /* optional edts atom */
             break;
+        }
         if (err != ERR_UNSUPPORTED) {
             ret = err;
             break;
@@ -1217,6 +1235,7 @@ int mp4read_close(void)
     freeMem(&mp4config.frame.info);
     freeMem(&mp4config.frame.map);
     freeMem(&mp4config.bitbuf.data);
+    freeMem(&mp4config.elst_entries);
 
     return ERR_OK;
 }
@@ -1254,12 +1273,51 @@ int mp4read_open(char *name)
 
     if (mp4config.has_elst)
     {
-        if (mp4config.elst_media_time >= 0 && mp4config.samplerate > 0 && mp4config.mvhd_timescale > 0)
+        /* Build the presentation timeline from the edit list. Empty edits
+           (media_time < 0) before the first media entry are a start offset;
+           non-empty entries map media samples onto the presentation. */
+        uint64_t lead_dur = 0;   /* leading empty edits, movie timescale */
+        uint64_t media_dur = 0;  /* non-empty edits, movie timescale */
+        uint64_t total_dur = 0;  /* all edits, movie timescale */
+        int64_t priming = -1;
+        uint32_t i;
+
+        for (i = 0; i < mp4config.elst_count; i++)
         {
-            mp4config.gapless_delay = (uint32_t)mp4config.elst_media_time;
-            /* Convert segment_duration (movie timescale) to audio sample frames */
-            double valid_dur_samples = (double)mp4config.elst_segment_duration * (double)mp4config.samplerate / (double)mp4config.mvhd_timescale;
-            mp4config.gapless_valid_samples = (uint64_t)(valid_dur_samples + 0.5);
+            uint64_t seg = mp4config.elst_entries[i].segment_duration;
+            int64_t mt = mp4config.elst_entries[i].media_time;
+
+            total_dur += seg;
+            if (mt < 0)
+            {
+                if (priming < 0)
+                    lead_dur += seg;
+                continue;
+            }
+            if (priming < 0)
+                priming = mt; /* media_time of first non-empty edit = priming delay in samples */
+            media_dur += seg;
+        }
+
+        if (priming < 0)
+        {
+            /* no media referenced at all: treat as if there were no edit list */
+            mp4config.has_elst = 0;
+        }
+        else if (mp4config.samplerate > 0 && mp4config.mvhd_timescale > 0)
+        {
+            double scale = (double)mp4config.samplerate / (double)mp4config.mvhd_timescale;
+            uint64_t media_samples = (uint64_t)(media_dur * scale + 0.5);
+
+            mp4config.gapless_delay = (priming > UINT32_MAX) ? UINT32_MAX : (uint32_t)priming;
+            mp4config.gapless_valid_samples = media_samples;
+            mp4config.elst_start_offset = (uint64_t)(lead_dur * scale + 0.5);
+            mp4config.elst_total_samples = (uint64_t)(total_dur * scale + 0.5);
+            /* rounding of the parts must not exceed the rounded total */
+            if (mp4config.elst_total_samples <
+                mp4config.elst_start_offset + media_samples)
+                mp4config.elst_total_samples =
+                    mp4config.elst_start_offset + media_samples;
             mp4config.has_gapless_info = 1;
         }
     }

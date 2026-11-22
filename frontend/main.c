@@ -778,6 +778,44 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
     return frameInfo.error;
 }
 
+/* Write 'frames' silent sample frames (all channels) to the output file.
+   Used to materialize empty edit list segments. Returns 0 on success. */
+static int write_silence(audio_file *aufile, int channels,
+                         unsigned char outputFormat, uint64_t frames)
+{
+    static const unsigned char zeros[4096];
+    size_t sample_size;
+    size_t frame_bytes;
+
+    switch (outputFormat)
+    {
+    case FAAD_FMT_24BIT:
+    case FAAD_FMT_32BIT:
+    case FAAD_FMT_FLOAT:
+        sample_size = sizeof(int32_t);
+        break;
+    case FAAD_FMT_DOUBLE:
+        sample_size = sizeof(double);
+        break;
+    default:
+        sample_size = sizeof(int16_t);
+        break;
+    }
+    frame_bytes = sample_size * channels;
+
+    while (frames > 0)
+    {
+        uint64_t chunk = frames;
+        if (chunk > sizeof(zeros) / frame_bytes)
+            chunk = sizeof(zeros) / frame_bytes;
+        if (write_audio_file(aufile, (void *)zeros, (int)(chunk * channels)) == 0)
+            return -1;
+        frames -= chunk;
+    }
+
+    return 0;
+}
+
 static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_stdout,
                   unsigned char outputFormat, int fileType, unsigned char downMatrix, int noGapless,
                   int infoOnly, int adts_out, float *song_length, float seek_to)
@@ -900,10 +938,13 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
         double rate_ratio = (double)mp4ASC.samplingFrequency / (double)mp4config.samplerate;
         mp4config.gapless_delay = (uint32_t)(mp4config.gapless_delay * rate_ratio + 0.5);
         mp4config.gapless_valid_samples = (uint64_t)(mp4config.gapless_valid_samples * rate_ratio + 0.5);
+        mp4config.elst_start_offset = (uint64_t)(mp4config.elst_start_offset * rate_ratio + 0.5);
+        mp4config.elst_total_samples = (uint64_t)(mp4config.elst_total_samples * rate_ratio + 0.5);
     }
 
     uint32_t net_start_trim = 0;
     uint64_t target_valid_samples = 0;
+    uint64_t leading_silence = 0;
     uint64_t written_audio_frames = 0;
     int enable_gapless_trim = !noGapless;
 
@@ -920,6 +961,16 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
                 net_start_trim = 0;
 
             target_valid_samples = mp4config.gapless_valid_samples;
+
+            if (mp4config.has_elst && mp4config.elst_total_samples > 0)
+            {
+                /* The edit list defines the presentation timeline: leading
+                   empty edits become silent samples at the start of the
+                   output; the media portion is trimmed to the non-empty
+                   edits (gapless_valid_samples); any trailing empty edits
+                   are padded with silence after decoding. */
+                leading_silence = mp4config.elst_start_offset;
+            }
         }
         else if (mp4config.samples > 0)
         {
@@ -988,6 +1039,20 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
                     NeAACDecClose(hDecoder);
                     mp4read_close();
                     return 0;
+                }
+                if (leading_silence > 0)
+                {
+                    /* Leading empty edit: the presentation timeline starts
+                       with silence before the first media sample. */
+                    if (write_silence(aufile, frameInfo.channels, outputFormat,
+                                      leading_silence) != 0)
+                    {
+                        NeAACDecClose(hDecoder);
+                        mp4read_close();
+                        close_audio_file(aufile);
+                        return 1;
+                    }
+                    leading_silence = 0;
                 }
             }
             first_time = 0;
@@ -1065,6 +1130,19 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
         {
             faad_fprintf(stderr, "Warning: %s\n",
                 NeAACDecGetErrorMessage(frameInfo.error));
+        }
+    }
+
+    /* Trailing empty edits: pad the rest of the presentation timeline with
+       silence so the output length matches the edit list. */
+    if (!first_time && !adts_out && enable_gapless_trim &&
+        mp4config.has_elst && mp4config.elst_total_samples > 0)
+    {
+        uint64_t presented = mp4config.elst_start_offset + written_audio_frames;
+        if (mp4config.elst_total_samples > presented)
+        {
+            write_silence(aufile, frameInfo.channels, outputFormat,
+                          mp4config.elst_total_samples - presented);
         }
     }
 

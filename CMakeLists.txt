@@ -265,6 +265,19 @@ if (FAAD_BUILD_CLI)
     set_target_properties(faad_cli PROPERTIES OUTPUT_NAME faad)
   endif()
 endif()
+
+# Tests
+option(FAAD_BUILD_TESTS "Enable tests" ON)
+if (FAAD_BUILD_TESTS AND FAAD_BUILD_CLI)
+  enable_testing()
+  find_package(Python3 COMPONENTS Interpreter)
+  if (Python3_Interpreter_FOUND)
+    add_test(NAME elst_timeline
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_elst.py
+                     $<TARGET_FILE:faad_cli>)
+  endif()
+endif()
 # Installation
 
 if(NOT FAAD_BUNDLED_MODE)

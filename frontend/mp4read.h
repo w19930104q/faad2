@@ -31,6 +31,13 @@ typedef struct
     uint32_t samplesperchunk;
 } slice_info_t;
 
+/* one edit list ('elst') entry */
+typedef struct
+{
+    uint64_t segment_duration; /* in movie (mvhd) timescale */
+    int64_t media_time;        /* in media (sample rate) timescale; <0 = empty edit */
+} elst_entry_t;
+
 typedef struct
 {
     uint32_t ctime, mtime;
@@ -46,10 +53,19 @@ typedef struct
     uint32_t gapless_padding;
     int has_gapless_info;
 
-    // raw elst values preserved until samplerate is available
-    int64_t elst_media_time;
-    uint64_t elst_segment_duration;
+    // edit list ('elst'): full presentation timeline
+    elst_entry_t *elst_entries;
+    uint32_t elst_count;
     int has_elst;
+    /* Values derived from the edit list, in audio sample frames per
+       channel (valid when has_elst is set):
+       - elst_start_offset:  duration of leading empty edits, i.e. the
+         presentation delay before the first media sample;
+       - elst_total_samples: full presentation duration, empty edits
+         included. The presented media (non-empty edits) is
+         gapless_valid_samples. */
+    uint64_t elst_start_offset;
+    uint64_t elst_total_samples;
     // sample depth
     uint32_t bits;
     // buffer config
