@@ -428,7 +428,14 @@ static void usage(void)
     faad_fprintf(stdout, "        2:  LC (Low Complexity) object type.\n");
     faad_fprintf(stdout, "        4:  LTP (Long Term Prediction) object type.\n");
     faad_fprintf(stdout, "        23: LD (Low Delay) object type.\n");
-    faad_fprintf(stdout, " -d    Down matrix 5.1 to 2 channels\n");
+    faad_fprintf(stdout, " -d    Downmix multichannel (5.1/6.1/7.1) to 2 channels.\n");
+    faad_fprintf(stdout, " -D X  Downmix matrix profile (requires -d). Valid values:\n");
+    faad_fprintf(stdout, "        mpeg/0: normalized MPEG matrix (default, legacy compatible).\n");
+    faad_fprintf(stdout, "        itu/1:  ITU-R BS.775 family matrix, unnormalized.\n");
+    faad_fprintf(stdout, " -P X  Downmix peak control (requires -d). Valid values:\n");
+    faad_fprintf(stdout, "        default/0: no extra peak control (default, see docs/downmix.md).\n");
+    faad_fprintf(stdout, "        clip/1:    hard clip at internal full scale.\n");
+    faad_fprintf(stdout, "        scale/2:   scale by the documented layout headroom factor.\n");
     faad_fprintf(stdout, " -w    Write output to stdio instead of a file.\n");
     faad_fprintf(stdout, " -g    Disable gapless decoding.\n");
     faad_fprintf(stdout, " -q    Quiet - suppresses status messages.\n");
@@ -444,8 +451,9 @@ static void usage(void)
 
 static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_stdout,
                   int def_srate, unsigned char object_type, unsigned char outputFormat, int fileType,
-                  unsigned char downMatrix, int infoOnly, int adts_out, unsigned char old_format,
-                  float *song_length)
+                  unsigned char downMatrix, unsigned char downMixProfile,
+                  unsigned char downMixPeak, int infoOnly, int adts_out,
+                  unsigned char old_format, float *song_length)
 {
     int tagsize;
     unsigned long samplerate;
@@ -562,6 +570,8 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
     config->defObjectType = object_type;
     config->outputFormat = outputFormat;
     config->downMatrix = downMatrix;
+    config->downMixProfile = downMixProfile;
+    config->downMixPeak = downMixPeak;
     config->useOldADTSFormat = old_format;
     //config->dontUpSampleImplicitSBR = 1;
     NeAACDecSetConfiguration(hDecoder, config);
@@ -779,7 +789,8 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
 }
 
 static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_stdout,
-                  unsigned char outputFormat, int fileType, unsigned char downMatrix, int noGapless,
+                  unsigned char outputFormat, int fileType, unsigned char downMatrix,
+                  unsigned char downMixProfile, unsigned char downMixPeak, int noGapless,
                   int infoOnly, int adts_out, float *song_length, float seek_to)
 {
     /*int track;*/
@@ -832,6 +843,8 @@ static int decodeMP4file(char *mp4file, char *sndfile, char *adts_fn, int to_std
     config = NeAACDecGetCurrentConfiguration(hDecoder);
     config->outputFormat = outputFormat;
     config->downMatrix = downMatrix;
+    config->downMixProfile = downMixProfile;
+    config->downMixPeak = downMixPeak;
     //config->dontUpSampleImplicitSBR = 1;
     NeAACDecSetConfiguration(hDecoder, config);
 
@@ -1092,6 +1105,8 @@ static int faad_main(int argc, char *argv[])
     unsigned char object_type = LC;
     int def_srate = 0;
     unsigned char downMatrix = 0;
+    unsigned char downMixProfile = FAAD_DMX_PROFILE_MPEG;
+    unsigned char downMixPeak = FAAD_DMX_PEAK_DEFAULT;
     int format = 1;
     unsigned char outputFormat = FAAD_FMT_16BIT;
     int outfile_set = 0;
@@ -1136,7 +1151,9 @@ static int faad_main(int argc, char *argv[])
             { "bits",       0, 0, 'b' },
             { "samplerate", 0, 0, 's' },
             { "objecttype", 0, 0, 'l' },
-            { "downmix",    0, 0, 'd' },
+            { "downmix",        0, 0, 'd' },
+            { "downmix-profile", 1, 0, 'D' },
+            { "downmix-peak",   1, 0, 'P' },
             { "info",       0, 0, 'i' },
             { "stdio",      0, 0, 'w' },
             { "seek",       1, 0, 'j' },
@@ -1144,7 +1161,7 @@ static int faad_main(int argc, char *argv[])
             { 0, 0, 0, 0 }
         };
 
-        c = getopt_long(argc, argv, "o:a:s:f:b:l:j:wgdhitq",
+        c = getopt_long(argc, argv, "o:a:s:f:b:l:j:wdD:P:ghitq",
             long_options, &option_index);
 
         if (c == -1)
@@ -1250,6 +1267,38 @@ static int faad_main(int argc, char *argv[])
             break;
         case 'd':
             downMatrix = 1;
+            break;
+        case 'D':
+            if (optarg)
+            {
+                if (!strcmp(optarg, "mpeg") || !strcmp(optarg, "0"))
+                    downMixProfile = FAAD_DMX_PROFILE_MPEG;
+                else if (!strcmp(optarg, "itu") || !strcmp(optarg, "1"))
+                    downMixProfile = FAAD_DMX_PROFILE_ITU;
+                else
+                {
+                    faad_fprintf(stderr, "Invalid downmix profile '%s' "
+                        "(valid: mpeg, itu).\n", optarg);
+                    return 1;
+                }
+            }
+            break;
+        case 'P':
+            if (optarg)
+            {
+                if (!strcmp(optarg, "default") || !strcmp(optarg, "0"))
+                    downMixPeak = FAAD_DMX_PEAK_DEFAULT;
+                else if (!strcmp(optarg, "clip") || !strcmp(optarg, "1"))
+                    downMixPeak = FAAD_DMX_PEAK_CLIP;
+                else if (!strcmp(optarg, "scale") || !strcmp(optarg, "2"))
+                    downMixPeak = FAAD_DMX_PEAK_SCALE;
+                else
+                {
+                    faad_fprintf(stderr, "Invalid downmix peak control '%s' "
+                        "(valid: default, clip, scale).\n", optarg);
+                    return 1;
+                }
+            }
             break;
         case 'w':
             writeToStdio = 1;
@@ -1383,7 +1432,8 @@ static int faad_main(int argc, char *argv[])
     if (mp4file)
     {
         result = decodeMP4file(aacFileName, audioFileName, adtsFileName, writeToStdio,
-            outputFormat, format, downMatrix, noGapless, infoOnly, adts_out, &length, seekTo);
+            outputFormat, format, downMatrix, downMixProfile, downMixPeak, noGapless,
+            infoOnly, adts_out, &length, seekTo);
     } else {
 
     if (readFromStdin == 1) {
@@ -1398,8 +1448,8 @@ static int faad_main(int argc, char *argv[])
     }
 
         result = decodeAACfile(aacFileName, audioFileName, adtsFileName, writeToStdio,
-            def_srate, object_type, outputFormat, format, downMatrix, infoOnly, adts_out,
-            old_format, &length);
+            def_srate, object_type, outputFormat, format, downMatrix, downMixProfile,
+            downMixPeak, infoOnly, adts_out, old_format, &length);
     }
 
     if (audioFileName != NULL)

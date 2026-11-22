@@ -135,6 +135,8 @@ NeAACDecHandle NeAACDecOpen(void)
     hDecoder->config.defObjectType = MAIN;
     hDecoder->config.defSampleRate = 44100; /* Default: 44.1kHz */
     hDecoder->config.downMatrix = 0;
+    hDecoder->config.downMixProfile = FAAD_DMX_PROFILE_MPEG;
+    hDecoder->config.downMixPeak = FAAD_DMX_PEAK_DEFAULT;
     hDecoder->adts_header_present = 0;
     hDecoder->adif_header_present = 0;
     hDecoder->latm_header_present = 0;
@@ -228,6 +230,14 @@ unsigned char NeAACDecSetConfiguration(NeAACDecHandle hpDecoder,
         if (config->downMatrix > 1)
             return 0;
         hDecoder->config.downMatrix = config->downMatrix;
+
+        if (config->downMixProfile > FAAD_DMX_PROFILE_ITU)
+            return 0;
+        hDecoder->config.downMixProfile = config->downMixProfile;
+
+        if (config->downMixPeak > FAAD_DMX_PEAK_SCALE)
+            return 0;
+        hDecoder->config.downMixPeak = config->downMixPeak;
 
         /* OK */
         return 1;
@@ -338,7 +348,9 @@ long NeAACDecInit(NeAACDecHandle hpDecoder,
             hDecoder->object_type = adts.profile + 1;
 
             *samplerate = get_sample_rate(hDecoder->sf_index);
-            *channels = (adts.channel_configuration > 6) ?
+            /* channelConfiguration 7 is the defined 7.1 layout; only
+             * values without a defined layout are reported as stereo. */
+            *channels = (adts.channel_configuration > 7) ?
                 2 : adts.channel_configuration;
         }
 
@@ -591,14 +603,6 @@ static void create_channel_config(NeAACDecStruct *hDecoder, NeAACDecFrameInfo *h
     hInfo->num_back_channels = 0;
     hInfo->num_lfe_channels = 0;
     memset(hInfo->channel_position, 0, MAX_CHANNELS*sizeof(uint8_t));
-
-    if (hDecoder->downMatrix)
-    {
-        hInfo->num_front_channels = 2;
-        hInfo->channel_position[0] = FRONT_CHANNEL_LEFT;
-        hInfo->channel_position[1] = FRONT_CHANNEL_RIGHT;
-        return;
-    }
 
     /* check if there is a PCE */
     /* TODO: why CPE flag is ignored? */
@@ -879,6 +883,8 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
 
     memset(hInfo, 0, sizeof(NeAACDecFrameInfo));
     memset(hDecoder->internal_channel, 0, MAX_CHANNELS*sizeof(hDecoder->internal_channel[0]));
+    hDecoder->downMatrix = 0;
+    memset(&hDecoder->downmix_plan, 0, sizeof(hDecoder->downmix_plan));
 
 #ifdef USE_TIME_LIMIT
     if ((TIME_LIMIT * get_sample_rate(hDecoder->sf_index)) > hDecoder->TL_count)
@@ -1040,12 +1046,14 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
             hDecoder->channelConfiguration = 0;
     }
 
-    if ((channels == 5 || channels == 6) && hDecoder->config.downMatrix)
+    /* Downmixing any layout with at least a stereo pair to 2 channels.
+     * Whether the concrete layout is representable by a downmix matrix
+     * is decided below via downmix_build_plan(). */
+    output_channels = channels;
+    if (channels >= 5 && hDecoder->config.downMatrix)
     {
         hDecoder->downMatrix = 1;
         output_channels = 2;
-    } else {
-        output_channels = channels;
     }
 
 #if (defined(PS_DEC) || defined(DRM_PS))
@@ -1053,7 +1061,7 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
 #endif
 
     /* Make a channel configuration based on either a PCE or a channelConfiguration */
-    if (!hDecoder->downMatrix && hDecoder->pce_set)
+    if (hDecoder->pce_set)
     {
         /* In some codepath program_config_element result is ignored. */
         if (hDecoder->pce.channels > MAX_CHANNELS)
@@ -1063,6 +1071,28 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
         }
     }
     create_channel_config(hDecoder, hInfo);
+
+    if (hDecoder->downMatrix)
+    {
+        if (!downmix_build_plan(&hDecoder->downmix_plan,
+                                hInfo->channel_position,
+                                hDecoder->internal_channel, channels,
+                                hDecoder->config.downMixProfile,
+                                hDecoder->config.downMixPeak))
+        {
+            /* Layout not representable (no stereo pair): fall back to
+             * the unmodified multichannel output. */
+            hDecoder->downMatrix = 0;
+            output_channels = channels;
+        } else {
+            hInfo->num_front_channels = 2;
+            hInfo->num_side_channels = 0;
+            hInfo->num_back_channels = 0;
+            hInfo->num_lfe_channels = 0;
+            hInfo->channel_position[0] = FRONT_CHANNEL_LEFT;
+            hInfo->channel_position[1] = FRONT_CHANNEL_RIGHT;
+        }
+    }
 
     /* number of samples in this frame */
     hInfo->samples = frame_len*output_channels;

@@ -296,3 +296,23 @@ if(NOT FAAD_BUNDLED_MODE)
     RENAME faad.1
   )
 endif()  # FAAD_BUNDLED_MODE
+
+# --- Downmix unit tests ------------------------------------------------
+option(FAAD_BUILD_TESTS "Build downmix unit tests" OFF)
+if(FAAD_BUILD_TESTS)
+  enable_testing()
+  add_executable(test_downmix
+    tests/test_downmix.c
+    libfaad/downmix.c
+    tests/test_stubs.c
+  )
+  target_include_directories(test_downmix PRIVATE
+    libfaad
+    ${CMAKE_CURRENT_BINARY_DIR}/include
+  )
+  target_compile_definitions(test_downmix PRIVATE ${FAAD_DEFINES})
+  if(NOT MSVC)
+    target_link_libraries(test_downmix PRIVATE m)
+  endif()
+  add_test(NAME downmix_unit COMMAND test_downmix)
+endif()

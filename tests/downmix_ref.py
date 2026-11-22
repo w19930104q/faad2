@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Independent reference for the configurable stereo downmix.
+
+Recomputes every expected sample of tests/test_downmix.c from the
+documented matrix formula (see docs/downmix.md) and regenerates
+tests/downmix_expected.h. All arithmetic is done in IEEE-754 binary32
+so the no-peak-control results can be compared bit-for-bit against the
+C float build.
+
+Run with: python3 -I tests/downmix_ref.py
+"""
+import struct
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Public channel role constants (mirror include/neaacdec.h)
+FRONT_C, FRONT_L, FRONT_R = 1, 2, 3
+SIDE_L, SIDE_R = 4, 5
+BACK_L, BACK_R, BACK_C, LFE = 6, 7, 8, 9
+
+F32 = lambda x: struct.unpack('f', struct.pack('f', x))[0]
+
+
+def c_float_literal(text):
+    """Emulate a C `float v = <text>;` initializer: the decimal constant
+    is first rounded to double (translation phase) and then to float."""
+    return F32(float(text))
+
+
+RSQRT2 = c_float_literal('0.7071067811865475244')
+HALF = c_float_literal('0.5')
+DM_MUL_LEGACY = c_float_literal('0.3203772410170407')
+
+PROFILE_MPEG, PROFILE_ITU = 0, 1
+PEAK_DEFAULT, PEAK_CLIP, PEAK_SCALE = 0, 1, 2
+
+N = 8
+POSITIONS = {
+    '51': [FRONT_C, FRONT_L, FRONT_R, BACK_L, BACK_R, LFE],
+    '61': [FRONT_C, FRONT_L, FRONT_R, SIDE_L, SIDE_R, BACK_C, LFE],
+    '71': [FRONT_C, FRONT_L, FRONT_R, SIDE_L, SIDE_R, BACK_L, BACK_R, LFE],
+}
+
+
+# Internal time_out full-scale magnitude; float PCM output divides by
+# this (FLOAT_SCALE = 1/32768).
+FS = 32768.0
+
+
+def make_inputs(nch):
+    """Same synthetic table as make_inputs() in test_downmix.c, in the
+    internal +/-32768 real_t scale."""
+    base = {6: 0.10, 7: 0.09, 8: 0.08}[nch]
+    rows = []
+    for ch in range(nch):
+        row = [F32(F32(base * (ch + 1) + 0.01 * i) * FS) for i in range(N)]
+        rows.append(row)
+    for ch in range(nch):
+        rows[ch][N - 1] = F32(0.3 * FS) if ch == nch - 1 else F32(FS)
+    return rows
+
+
+def raw_terms(positions):
+    """Per-bus raw (internal_index, weight) terms, in C accumulation
+    order: direct L/R, then C / surround pairs / back center."""
+    left, right = [], []
+    for idx, role in enumerate(positions):
+        if role == FRONT_L:
+            left.append((idx, F32(1.0)))
+        if role == FRONT_R:
+            right.append((idx, F32(1.0)))
+    surround_pairs = 0
+    have_bc = False
+    for idx, role in enumerate(positions):
+        if role == FRONT_C:
+            left.append((idx, RSQRT2))
+            right.append((idx, RSQRT2))
+        elif role in (SIDE_L, BACK_L):
+            left.append((idx, RSQRT2))
+            surround_pairs += 1
+        elif role in (SIDE_R, BACK_R):
+            right.append((idx, RSQRT2))
+        elif role == BACK_C:
+            left.append((idx, HALF))
+            right.append((idx, HALF))
+            have_bc = True
+    legacy = surround_pairs == 1 and not have_bc
+    return left, right, legacy, have_bc
+
+
+def headroom(left, right):
+    # Mirror the C expression  REAL_CONST(1.0) / s_worst  exactly: C
+    # stores the operands and result in binary32 (build uses
+    # -ffloat-store), so every intermediate here is rounded too.
+    s_l = F32(0.0)
+    for _, w in left:
+        s_l = F32(s_l + (F32(-w) if w < 0 else w))
+    s_r = F32(0.0)
+    for _, w in right:
+        s_r = F32(s_r + (F32(-w) if w < 0 else w))
+    s = s_l if s_l > s_r else s_r
+    return F32(F32(1.0) / s)
+
+
+def gain_for(profile, peak, legacy, hdr):
+    if profile == PROFILE_MPEG:
+        g = DM_MUL_LEGACY if legacy else hdr
+        if peak == PEAK_SCALE:
+            g = hdr
+        return g
+    return hdr if peak == PEAK_SCALE else F32(1.0)
+
+
+def apply_bus(terms, rows, i, gain, profile, peak):
+    # C order: start at 0, multiply each term then add.
+    acc = F32(0.0)
+    for idx, w in terms:
+        acc = F32(acc + F32(rows[idx][i] * w))
+    acc = F32(acc * gain)
+    # The float C build only clips explicitly on the ITU profile;
+    # MPEG is normalization-only and integer PCM saturates later. The
+    # threshold is the internal +/-32768 full-scale magnitude.
+    if profile == PROFILE_ITU and peak == PEAK_CLIP:
+        if acc > F32(FS):
+            acc = F32(FS)
+        elif acc < F32(-FS):
+            acc = F32(-FS)
+    return acc
+
+
+def layout_expected(key):
+    nch = len(POSITIONS[key])
+    rows = make_inputs(nch)
+    left, right, legacy, have_bc = raw_terms(POSITIONS[key])
+    hdr = headroom(left, right)
+    out = []
+    for profile in (PROFILE_MPEG, PROFILE_ITU):
+        for peak in (PEAK_DEFAULT, PEAK_CLIP, PEAK_SCALE):
+            gain = gain_for(profile, peak, legacy, hdr)
+            for i in range(N):
+                l = apply_bus(left, rows, i, gain, profile, peak)
+                r = apply_bus(right, rows, i, gain, profile, peak)
+                out.append((l, r))
+    return out, hdr, legacy
+
+
+def hex_f(x):
+    return '0x%08Xu' % struct.unpack('I', struct.pack('f', x))[0]
+
+
+def main():
+    header = ['/* Generated by tests/downmix_ref.py - do not edit. */',
+              '#ifndef __DOWNMIX_EXPECTED_H__',
+              '#define __DOWNMIX_EXPECTED_H__',
+              '#include "downmix.h"',
+              'typedef struct { float left; float right; } dmx_expected_t;',
+              '#define DMX_EXPECTED_N (2 * 3 * %d)' % N]
+    for key in ('51', '61', '71'):
+        vals, hdr, legacy = layout_expected(key)
+        header.append('/* layout %s: headroom(1/S)=%.12f legacy_5x=%d */'
+                      % (key, hdr, legacy))
+        header.append('static const dmx_expected_t EXPECTED_%s[DMX_EXPECTED_N] = {' % key)
+        k = 0
+        for profile in ('MPEG', 'ITU'):
+            for peak in range(3):
+                header.append('  /* profile=%s peak=%d */' % (profile, peak))
+                for _ in range(N):
+                    l, r = vals[k]
+                    k += 1
+                    header.append('  { %af, %af }, /* bits %s %s */'
+                                  % (l, r, hex_f(l), hex_f(r)))
+        header.append('};')
+    header.append('#endif')
+    path = os.path.join(ROOT, 'tests', 'downmix_expected.h')
+    with open(path, 'w') as f:
+        f.write('\n'.join(header) + '\n')
+    print('wrote', path)
+
+    # Sanity: print the worst-case extreme sample per profile for review.
+    for key in ('51', '61', '71'):
+        vals, hdr, _ = layout_expected(key)
+        print('layout', key, 'headroom=%.9f' % hdr)
+        idx_itu_default = (1 * 3 + 0) * N + (N - 1)
+        idx_itu_clip = (1 * 3 + 1) * N + (N - 1)
+        idx_mpeg_default = (0 * 3 + 0) * N + (N - 1)
+        print('  extreme ITU/default:', vals[idx_itu_default])
+        print('  extreme ITU/clip:   ', vals[idx_itu_clip])
+        print('  extreme MPEG/default:', vals[idx_mpeg_default])
+
+
+if __name__ == '__main__':
+    main()

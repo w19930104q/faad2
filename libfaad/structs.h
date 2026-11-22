@@ -36,6 +36,7 @@ extern "C" {
 #endif
 
 #include "cfft.h"
+#include "downmix.h"
 #ifdef SBR_DEC
 #include "sbr_dec.h"
 #endif
@@ -425,6 +426,9 @@ typedef struct
     program_config pce;
     uint8_t element_id[MAX_CHANNELS];
     uint8_t internal_channel[MAX_CHANNELS];
+
+    /* resolved per frame when the configured downmix is active */
+    downmix_plan_t downmix_plan;
 
     /* Configuration data */
     NeAACDecConfiguration config;

@@ -32,32 +32,20 @@
 #include "structs.h"
 
 #include "output.h"
+#include "downmix.h"
 
 #ifndef FIXED_POINT
 
 
 #define FLOAT_SCALE (1.0f/(1<<15))
 
-#define DM_MUL REAL_CONST(0.3203772410170407) // 1/(1+sqrt(2) + 1/sqrt(2))
-#define RSQRT2 REAL_CONST(0.7071067811865475244) // 1/sqrt(2)
 
-
-static INLINE real_t get_sample(real_t **input, uint8_t channel, uint16_t sample,
-                                uint8_t down_matrix, uint8_t *internal_channel)
+static INLINE real_t get_sample(NeAACDecStruct *hDecoder, real_t **input,
+                                uint8_t channel, uint16_t sample)
 {
-    if (!down_matrix)
-        return input[internal_channel[channel]][sample];
-
-    if (channel == 0)
-    {
-        return DM_MUL * (input[internal_channel[1]][sample] +
-            input[internal_channel[0]][sample] * RSQRT2 +
-            input[internal_channel[3]][sample] * RSQRT2);
-    } else {
-        return DM_MUL * (input[internal_channel[2]][sample] +
-            input[internal_channel[0]][sample] * RSQRT2 +
-            input[internal_channel[4]][sample] * RSQRT2);
-    }
+    if (hDecoder->downMatrix)
+        return downmix_apply(&hDecoder->downmix_plan, input, sample, channel);
+    return input[hDecoder->internal_channel[channel]][sample];
 }
 
 #ifndef HAS_LRINTF
@@ -140,7 +128,7 @@ static void to_PCM_16bit(NeAACDecStruct *hDecoder, real_t **input,
         {
             for(i = 0; i < frame_len; i++)
             {
-                real_t inp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->internal_channel);
+                real_t inp = get_sample(hDecoder, input, ch, i);
 
                 CLIP(inp, 32767.0f, -32768.0f);
 
@@ -209,7 +197,7 @@ static void to_PCM_24bit(NeAACDecStruct *hDecoder, real_t **input,
         {
             for(i = 0; i < frame_len; i++)
             {
-                real_t inp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->internal_channel);
+                real_t inp = get_sample(hDecoder, input, ch, i);
 
                 inp *= 256.0f;
                 CLIP(inp, 8388607.0f, -8388608.0f);
@@ -279,7 +267,7 @@ static void to_PCM_32bit(NeAACDecStruct *hDecoder, real_t **input,
         {
             for(i = 0; i < frame_len; i++)
             {
-                real_t inp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->internal_channel);
+                real_t inp = get_sample(hDecoder, input, ch, i);
 
                 inp *= 65536.0f;
                 CLIP(inp, 2147483647.0f, -2147483648.0f);
@@ -335,7 +323,7 @@ static void to_PCM_float(NeAACDecStruct *hDecoder, real_t **input,
         {
             for(i = 0; i < frame_len; i++)
             {
-                real_t inp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->internal_channel);
+                real_t inp = get_sample(hDecoder, input, ch, i);
                 (*sample_buffer)[(i*channels)+ch] = inp*FLOAT_SCALE;
             }
         }
@@ -387,7 +375,7 @@ static void to_PCM_double(NeAACDecStruct *hDecoder, real_t **input,
         {
             for(i = 0; i < frame_len; i++)
             {
-                real_t inp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->internal_channel);
+                real_t inp = get_sample(hDecoder, input, ch, i);
                 (*sample_buffer)[(i*channels)+ch] = (double)inp*FLOAT_SCALE;
             }
         }
@@ -438,32 +426,12 @@ void *output_to_PCM(NeAACDecStruct *hDecoder,
 
 #else
 
-#define DM_MUL FRAC_CONST(0.3203772410170407) // 1/(1+sqrt(2) + 1/sqrt(2))
-#define RSQRT2 FRAC_CONST(0.7071067811865475244) // 1/sqrt(2)
-#define BOTH FRAC_CONST(0.2265409196609864215998) // 1/(sqrt(2) + 2 + 1)
-
-static INLINE real_t get_sample(real_t **input, uint8_t channel, uint16_t sample,
-                                uint8_t down_matrix, uint8_t up_matrix,
-                                uint8_t *internal_channel)
+static INLINE real_t get_sample(NeAACDecStruct *hDecoder, real_t **input,
+                                uint8_t channel, uint16_t sample)
 {
-    real_t C;
-    if (up_matrix == 1)
-        return input[internal_channel[0]][sample];
-
-    if (!down_matrix)
-        return input[internal_channel[channel]][sample];
-
-    C = MUL_F(input[internal_channel[0]][sample], BOTH);
-    if (channel == 0)
-    {
-        real_t L_S = MUL_F(input[internal_channel[3]][sample], BOTH);
-        real_t core = MUL_F(input[internal_channel[1]][sample], DM_MUL);
-        return core + C + L_S;
-    } else {
-        real_t R_S = MUL_F(input[internal_channel[4]][sample], BOTH);
-        real_t core = MUL_F(input[internal_channel[2]][sample], DM_MUL);
-        return core + C + R_S;
-    }
+    if (hDecoder->downMatrix)
+        return downmix_apply(&hDecoder->downmix_plan, input, sample, channel);
+    return input[hDecoder->internal_channel[channel]][sample];
 }
 
 void* output_to_PCM(NeAACDecStruct *hDecoder,
@@ -484,8 +452,7 @@ void* output_to_PCM(NeAACDecStruct *hDecoder,
         case FAAD_FMT_16BIT:
             for(i = 0; i < frame_len; i++)
             {
-                int32_t tmp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->upMatrix,
-                    hDecoder->internal_channel);
+                int32_t tmp = get_sample(hDecoder, input, ch, i);
                 if (tmp >= 0)
                 {
                     if (tmp <= 0x7FFFFFFF - (1 << (REAL_BITS-1)))
@@ -509,8 +476,7 @@ void* output_to_PCM(NeAACDecStruct *hDecoder,
         case FAAD_FMT_24BIT:
             for(i = 0; i < frame_len; i++)
             {
-                int32_t tmp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->upMatrix,
-                    hDecoder->internal_channel);
+                int32_t tmp = get_sample(hDecoder, input, ch, i);
                 if (tmp >= 0)
                 {
                     if (tmp <= 0x7FFFFFFF - (1 << (REAL_BITS-9)))
@@ -538,8 +504,7 @@ void* output_to_PCM(NeAACDecStruct *hDecoder,
             sat_shift_mask = SAT_SHIFT_MASK(exp);
             for(i = 0; i < frame_len; i++)
             {
-                int32_t tmp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->upMatrix,
-                    hDecoder->internal_channel);
+                int32_t tmp = get_sample(hDecoder, input, ch, i);
                 if (tmp >= 0)
                 {
                     if (tmp <= 0x7FFFFFFF - half)
@@ -555,8 +520,7 @@ void* output_to_PCM(NeAACDecStruct *hDecoder,
         case FAAD_FMT_FIXED:
             for(i = 0; i < frame_len; i++)
             {
-                real_t tmp = get_sample(input, ch, i, hDecoder->downMatrix, hDecoder->upMatrix,
-                    hDecoder->internal_channel);
+                real_t tmp = get_sample(hDecoder, input, ch, i);
                 int_sample_buffer[(i*channels)+ch] = (int32_t)tmp;
             }
             break;

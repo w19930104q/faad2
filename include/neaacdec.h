@@ -129,6 +129,46 @@ extern "C" {
 #define DRMCH_SBR_STEREO    4
 #define DRMCH_SBR_PS_STEREO 5
 
+/*
+ * Downmix matrix profiles (NeAACDecConfiguration.downMixProfile).
+ * Only effective when downMatrix is enabled and the stream carries
+ * 5 or more full-band channels (5.1/6.1/7.1 and PCE variants).
+ *
+ * FAAD_DMX_PROFILE_MPEG: normalized matrix. The 5.1/5.0 case is bit
+ *   identical to the historical faad2 downmix; 6.1/7.1 use the same
+ *   raw coefficients with a documented layout normalization. Coherent
+ *   full-scale input can never exceed full scale, so peak control is a
+ *   no-op for integer PCM. See docs/downmix.md.
+ * FAAD_DMX_PROFILE_ITU: ITU-R BS.775 family coefficients without
+ *   normalization (unity direct gain, 1/sqrt(2) center/surround). The
+ *   coherent sum can reach 1/sqrt(2) above full scale; choose a peak
+ *   control mode (downMixPeak) to declare the clipping behaviour.
+ */
+#define FAAD_DMX_PROFILE_MPEG 0
+#define FAAD_DMX_PROFILE_ITU  1
+
+/*
+ * Peak control policy (NeAACDecConfiguration.downMixPeak).
+ *
+ * FAAD_DMX_PEAK_CLIP: after the matrix sum, samples outside the
+ *   internal full-scale range are hard-clipped. For floating point
+ *   output the clip is applied explicitly (at +/- 1.0 in the float
+ *   output scale); for integer PCM the existing per-format saturation
+ *   applies.
+ * FAAD_DMX_PEAK_SCALE: multiply the whole mix by the documented layout
+ *   headroom factor 1/S, where S is the largest sum of absolute
+ *   coefficients on either output bus. The coherent worst case then
+ *   stays at or below full scale; no clipping occurs.
+ *
+ * The default value FAAD_DMX_PEAK_DEFAULT declares no extra peak
+ * control: the matrix output is passed through untouched. Integer PCM
+ * is still saturated by the PCM conversion step; floating point output
+ * may then exceed +/- 1.0 with the ITU profile.
+ */
+#define FAAD_DMX_PEAK_DEFAULT 0
+#define FAAD_DMX_PEAK_CLIP    1
+#define FAAD_DMX_PEAK_SCALE   2
+
 
 /* A decode call can eat up to FAAD_MIN_STREAMSIZE bytes per decoded channel,
    so at least so much bytes per channel should be available in this stream */
@@ -169,6 +209,12 @@ typedef struct NeAACDecConfiguration
     unsigned char downMatrix;
     unsigned char useOldADTSFormat;
     unsigned char dontUpSampleImplicitSBR;
+    /* Matrix profile for multi-channel (>= 5 channels) to stereo
+       downmix: FAAD_DMX_PROFILE_MPEG or FAAD_DMX_PROFILE_ITU. */
+    unsigned char downMixProfile;
+    /* Peak control policy for the downmix:
+       FAAD_DMX_PEAK_DEFAULT, FAAD_DMX_PEAK_CLIP or FAAD_DMX_PEAK_SCALE. */
+    unsigned char downMixPeak;
 } NeAACDecConfiguration, *NeAACDecConfigurationPtr;
 
 typedef struct NeAACDecFrameInfo
