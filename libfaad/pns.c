@@ -40,38 +40,6 @@ static void gen_rand_vector(real_t *spec, int16_t scale_factor, uint16_t size,
                             /* RNG states */ uint32_t *__r1, uint32_t *__r2);
 
 
-#ifdef FIXED_POINT
-
-static real_t const pow2_table[] =
-{
-    COEF_CONST(1.0),
-    COEF_CONST(1.18920711500272),
-    COEF_CONST(1.41421356237310),
-    COEF_CONST(1.68179283050743)
-};
-
-// mean_energy_table[x] == sqrt(3 / x)
-static real_t const mean_energy_table[] =
-{
-    COEF_CONST(0.0),                // should not happen
-    COEF_CONST(1.7320508075688772),
-    COEF_CONST(1.224744871391589),
-    COEF_CONST(1.0),                // sqrt(3/3)
-    COEF_CONST(0.8660254037844386),
-    COEF_CONST(0.7745966692414834),
-    COEF_CONST(0.7071067811865476),
-    COEF_CONST(0.6546536707079771),
-    COEF_CONST(0.6123724356957945),
-    COEF_CONST(0.5773502691896257),
-    COEF_CONST(0.5477225575051661),
-    COEF_CONST(0.5222329678670935),
-    COEF_CONST(0.5),                // sqrt(3/12)
-    COEF_CONST(0.4803844614152614),
-    COEF_CONST(0.4629100498862757),
-    COEF_CONST(0.4472135954999579),
-};
-#endif
-
 /* The function gen_rand_vector(addr, size) generates a vector of length
    <size> with signed random values of average energy MEAN_NRG per random
    value. A suitable random number generator can be realized using one
@@ -107,8 +75,8 @@ static INLINE void gen_rand_vector(real_t *spec, int16_t scale_factor, uint16_t 
 #else
     uint16_t i;
     real_t scale;
-    int32_t exp, frac;
-    int32_t idx, mask;
+    int32_t log2_scale;
+    uint64_t energy = 0;
 
     /* IMDCT pre-scaling */
     scale_factor -= 4 * sub;
@@ -116,33 +84,47 @@ static INLINE void gen_rand_vector(real_t *spec, int16_t scale_factor, uint16_t 
     // 52 stands for 2**13 == 8192 factor; larger factor causes overflows later (in cfft).
     scale_factor = min(max(scale_factor, -(REAL_BITS * 4)), 52);
 
-    exp = scale_factor >> 2;
-    frac = scale_factor & 3;
-
-    /* 29 <= REAL_BITS + exp <= 0 */
-    mask = (1 << (REAL_BITS + exp)) - 1;
-
-    idx = size;
-    scale = COEF_CONST(1);
-    // At most 2 iterations.
-    while (idx >= 16)
-    {
-        idx >>= 2;
-        scale >>= 1;
-    }
-    scale = MUL_C(scale, mean_energy_table[idx]);
-    if (frac)
-        scale = MUL_C(scale, pow2_table[frac]);
-    // scale is less than 4.0 now.
-
+    /* Generate the random vector (same RNG sequence as the floating point
+       build) and accumulate its energy. The values are shifted down by 8
+       bits so that size * tmp^2 always fits in an uint64; the shift cancels
+       out in the energy normalisation below. */
     for (i = 0; i < size; i++)
     {
-        real_t tmp = (int32_t)ne_rng(__r1, __r2);
-        if (tmp < 0)
-            tmp = -(tmp & mask);
-        else
-            tmp = (tmp & mask);
-        spec[i] = MUL_C(tmp, scale);
+        int32_t tmp = (int32_t)ne_rng(__r1, __r2) >> 8;
+        spec[i] = tmp;
+        energy += (uint64_t)((int64_t)tmp * (int64_t)tmp);
+    }
+
+    if (energy > 0)
+    {
+        /* Normalise to the exact energy signalled by the scale factor, like
+           the floating point path does:
+             scale = 2^(scale_factor/4) / sqrt(energy)
+           computed in fixed point via log2/exp2:
+             log2(scale) = scale_factor/4 - log2(energy)/2   [Q(REAL_BITS)] */
+        log2_scale = (scale_factor * (1 << (REAL_BITS - 2)))
+                   - (int32_t)(log2_int(energy) >> 1);
+        /* The random values above are plain integers, not Q(REAL_BITS)
+           fixed point, so the multiplier is kept in Q(COEF_BITS) and the
+           product is shifted down by REAL_BITS below:
+             spec = (tmp * scale_Q28) >> REAL_BITS
+           Saturate the exponent at the largest value pow2_fix() can
+           represent; it can only be reached by a near-zero random vector
+           combined with the maximum scale factor, and keeps the multiply
+           below from overflowing. */
+        log2_scale += (COEF_BITS - REAL_BITS) << REAL_BITS;
+        if (log2_scale > (16 << REAL_BITS))
+            log2_scale = 16 << REAL_BITS;
+        scale = pow2_fix(log2_scale);
+        for (i = 0; i < size; i++)
+        {
+            spec[i] = MUL_R(spec[i], scale);
+        }
+    } else {
+        for (i = 0; i < size; i++)
+        {
+            spec[i] = 0;
+        }
     }
 #endif
 }

@@ -251,6 +251,7 @@ endforeach()
 
 # CLI
 option(FAAD_BUILD_CLI "Build faad_cli executable" ON)
+option(FAAD_BUILD_FIXED_CLI "Build faad_fixed_cli executable (fixed-point decoder)" ON)
 if (FAAD_BUILD_CLI)
   add_executable(faad_cli ${FAAD_SOURCES})
   target_link_libraries(faad_cli faad)
@@ -265,6 +266,20 @@ if (FAAD_BUILD_CLI)
     set_target_properties(faad_cli PROPERTIES OUTPUT_NAME faad)
   endif()
 endif()
+if (FAAD_BUILD_CLI AND FAAD_BUILD_FIXED_CLI)
+  add_executable(faad_fixed_cli ${FAAD_SOURCES})
+  target_link_libraries(faad_fixed_cli faad_fixed)
+  target_compile_definitions(faad_fixed_cli PRIVATE ${FAAD_DEFINES})
+  target_compile_options(faad_fixed_cli PRIVATE ${FAAD_FLAGS})
+
+  if (MSVC)
+    target_include_directories(faad_fixed_cli PRIVATE
+      frontend
+    )
+  else()
+    set_target_properties(faad_fixed_cli PROPERTIES OUTPUT_NAME faad_fixed)
+  endif()
+endif()
 # Installation
 
 if(NOT FAAD_BUNDLED_MODE)
@@ -274,6 +289,9 @@ if(NOT FAAD_BUNDLED_MODE)
   set(INSTALL_TARGETS faad faad_drm)
   if (FAAD_BUILD_CLI)
     list(APPEND INSTALL_TARGETS faad_cli)
+    if (FAAD_BUILD_FIXED_CLI)
+      list(APPEND INSTALL_TARGETS faad_fixed_cli)
+    endif()
   endif()
 
   install(
@@ -296,3 +314,15 @@ if(NOT FAAD_BUNDLED_MODE)
     RENAME faad.1
   )
 endif()  # FAAD_BUNDLED_MODE
+
+# Regression tests
+option(FAAD_BUILD_TESTING "Build regression tests" ON)
+if (FAAD_BUILD_TESTING AND FAAD_BUILD_CLI AND FAAD_BUILD_FIXED_CLI)
+  enable_testing()
+  add_test(
+    NAME fixed_float_consistency
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fixed_float_regression.sh
+            $<TARGET_FILE:faad_cli> $<TARGET_FILE:faad_fixed_cli>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/samples
+  )
+endif()
