@@ -56,6 +56,7 @@
 #include "unicode_support.h"
 #include "audio.h"
 #include "mp4read.h"
+#include "../libfaad/adts_seek.h"
 
 #ifndef min
 #define min(a,b) ( (a) < (b) ? (a) : (b) )
@@ -191,9 +192,7 @@ static void lookforheader(aac_buffer *b)
     }
 }
 
-static int adts_sample_rates[] = {96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350,0,0,0};
-
-static int adts_parse(aac_buffer *b, int *bitrate, float *length)
+static int adts_sample_rates[] = {96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350,0,0,0};static int adts_parse(aac_buffer *b, int *bitrate, float *length)
 {
     size_t frames;
     unsigned int frame_length;
@@ -432,7 +431,7 @@ static void usage(void)
     faad_fprintf(stdout, " -w    Write output to stdio instead of a file.\n");
     faad_fprintf(stdout, " -g    Disable gapless decoding.\n");
     faad_fprintf(stdout, " -q    Quiet - suppresses status messages.\n");
-    faad_fprintf(stdout, " -j X  Jump - start output X seconds into track (MP4 files only).\n");
+    faad_fprintf(stdout, " -j X  Jump - start output X seconds into track (MP4 and seekable ADTS files).\n");
     faad_fprintf(stdout, "Example:\n");
     faad_fprintf(stdout, "       %s infile.aac\n", progName);
     faad_fprintf(stdout, "       %s infile.mp4\n", progName);
@@ -442,10 +441,182 @@ static void usage(void)
     return;
 }
 
+/*
+ * Seekable ADTS decode path (-j on a regular file).
+ *
+ * The whole file is read once and indexed; the library then rebuilds the
+ * decoder state up to the target frame by priming.  Decoding proceeds frame
+ * by frame from the index so the output is byte-identical to the matching
+ * tail of a from-zero decode (the first output frame is trimmed to the
+ * requested in-frame sample offset).
+ */
+static int decodeAACfileSeeked(char *aacfile, char *sndfile, int to_stdout,
+                               int def_srate, unsigned char object_type,
+                               unsigned char outputFormat, int fileType,
+                               unsigned char downMatrix, float seek_to)
+{
+    FILE *infile;
+    unsigned char *data = NULL;
+    long file_size;
+    unsigned long size, frame_count, idx_rate, target_frame = 0;
+    unsigned long skipped = 0, f;
+    NeAACDecADTSIndex idx = NULL;
+    NeAACDecHandle hDecoder = NULL;
+    NeAACDecConfigurationPtr config;
+    NeAACDecFrameInfo frameInfo;
+    audio_file *aufile = NULL;
+    int first_time = 1;
+    int result = 1;
+    int sample_size;
+    unsigned long trim_samples = 0;
+
+    infile = faad_fopen(aacfile, "rb");
+    if (infile == NULL)
+    {
+        faad_fprintf(stderr, "Error opening file: %s\n", aacfile);
+        return 1;
+    }
+    if (fseek(infile, 0, SEEK_END) != 0 || (file_size = ftell(infile)) < 0 ||
+        fseek(infile, 0, SEEK_SET) != 0)
+    {
+        faad_fprintf(stderr, "Input not seekable %s\n", aacfile);
+        fclose(infile);
+        return 1;
+    }
+    size = (unsigned long)file_size;
+    data = (unsigned char*)malloc(size ? size : 1);
+    if (data == NULL)
+    {
+        faad_fprintf(stderr, "Memory allocation error\n");
+        fclose(infile);
+        return 1;
+    }
+    if (fread(data, 1, size, infile) != size)
+    {
+        faad_fprintf(stderr, "Error reading file: %s\n", aacfile);
+        goto seeked_end;
+    }
+    fclose(infile);
+    infile = NULL;
+
+    if (NeAACDecADTSIndexCreate(data, size, &idx, &frame_count,
+                                &idx_rate) != NE_AAC_ADTS_OK)
+    {
+        /* Not an ADTS stream (e.g. RAW/ADIF): seek support is ADTS-only. */
+        faad_fprintf(stderr, "Warning: seek is only supported on ADTS streams\n");
+        goto seeked_end;
+    }
+
+    hDecoder = NeAACDecOpen();
+    config = NeAACDecGetCurrentConfiguration(hDecoder);
+    if (def_srate)
+        config->defSampleRate = def_srate;
+    config->defObjectType = object_type;
+    config->outputFormat = outputFormat;
+    config->downMatrix = downMatrix;
+    NeAACDecSetConfiguration(hDecoder, config);
+
+    {
+        /* Round (do not truncate): the -j argument arrives through a
+         * float/double conversion, so exact frame boundaries can land a
+         * hair below the integer sample position. */
+        double wanted_d = seek_to * (double)idx_rate;
+        unsigned long wanted = (unsigned long)(wanted_d + 0.5);
+        unsigned long total = NeAACDecADTSIndexSampleCount(idx);
+        unsigned char rc;
+        if (wanted >= total)
+            wanted = total ? total - 1 : 0;
+        rc = NeAACDecADTSSeekCLI(hDecoder, idx, wanted,
+                                 &target_frame, &skipped);
+        if (rc != NE_AAC_ADTS_OK)
+        {
+            if (rc == NE_AAC_ADTS_ERR_NOTFOUND)
+                faad_fprintf(stderr, "Seek position %.3fs is past end of stream\n",
+                    seek_to);
+            else
+                faad_fprintf(stderr, "Seek failed (error %u)\n", rc);
+            goto seeked_end;
+        }
+        /* In-frame offset of the requested position, samples per channel. */
+        trim_samples = wanted - skipped;
+    }
+
+    sample_size = (outputFormat == FAAD_FMT_DOUBLE) ? 8 :
+        ((outputFormat == FAAD_FMT_16BIT) ? 2 : 4);
+
+    for (f = target_frame; f < frame_count; f++)
+    {
+        unsigned long off, len;
+        void *sample_buffer;
+        unsigned int sample_count;
+        void *curr_buffer;
+
+        if (NeAACDecADTSIndexGetFrame(idx, f, &off, &len) != NE_AAC_ADTS_OK)
+            break;
+        memset(&frameInfo, 0, sizeof(frameInfo));
+        sample_buffer = NeAACDecDecode(hDecoder, &frameInfo, data + off, len);
+        if (sample_buffer == NULL || frameInfo.error)
+        {
+            if (frameInfo.error)
+                faad_fprintf(stderr, "Error: %s\n",
+                    NeAACDecGetErrorMessage(frameInfo.error));
+            break;
+        }
+        if (frameInfo.samples == 0)
+            continue;
+
+        if (first_time)
+        {
+            print_channel_info(&frameInfo);
+            if (!to_stdout)
+                aufile = open_audio_file(sndfile, frameInfo.samplerate,
+                    frameInfo.channels, (int)outputFormat, fileType,
+                    aacChannelConfig2wavexChannelMask(&frameInfo));
+            else
+                aufile = open_audio_file("-", frameInfo.samplerate,
+                    frameInfo.channels, (int)outputFormat, fileType,
+                    aacChannelConfig2wavexChannelMask(&frameInfo));
+            if (aufile == NULL)
+                goto seeked_end;
+            first_time = 0;
+        }
+
+        curr_buffer = sample_buffer;
+        sample_count = frameInfo.samples;
+        if (f == target_frame && trim_samples > 0)
+        {
+            unsigned long trim_total = trim_samples * frameInfo.channels;
+            if (trim_total >= sample_count)
+                continue;
+            curr_buffer = (char*)curr_buffer +
+                trim_total * (unsigned int)sample_size;
+            sample_count -= (unsigned int)trim_total;
+        }
+
+        if (write_audio_file(aufile, curr_buffer, (int)sample_count) == 0)
+            break;
+    }
+
+    result = first_time ? 1 : 0;
+
+seeked_end:
+    if (aufile)
+        close_audio_file(aufile);
+    if (hDecoder)
+        NeAACDecClose(hDecoder);
+    if (idx)
+        NeAACDecADTSIndexDestroy(idx);
+    if (data)
+        free(data);
+    if (infile)
+        fclose(infile);
+    return result;
+}
+
 static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_stdout,
                   int def_srate, unsigned char object_type, unsigned char outputFormat, int fileType,
                   unsigned char downMatrix, int infoOnly, int adts_out, unsigned char old_format,
-                  float *song_length)
+                  float *song_length, float seek_to)
 {
     int tagsize;
     unsigned long samplerate;
@@ -478,6 +649,15 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
     aac_buffer b;
 
     memset(&b, 0, sizeof(aac_buffer));
+
+    /* Sample-accurate ADTS seeking needs a seekable regular file and the
+     * whole-file index; streamed input and ADTS re-muxing keep the classic
+     * path. */
+    if (seek_to > 0.0f && !adts_out && strcmp(aacfile, "-") != 0)
+    {
+        return decodeAACfileSeeked(aacfile, sndfile, to_stdout, def_srate,
+            object_type, outputFormat, fileType, downMatrix, seek_to);
+    }
 
     if (adts_out)
     {
@@ -1376,8 +1556,9 @@ static int faad_main(int argc, char *argv[])
     if (header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p')
         mp4file = 1;
 
-    if (!mp4file && seekTo != 0) {
-        faad_fprintf(stderr, "Warning: can only seek in MP4 files\n");
+    if (!mp4file && seekTo != 0 && readFromStdin) {
+        faad_fprintf(stderr, "Warning: can only seek in seekable files, ignoring -j for streamed input\n");
+        seekTo = 0;
     }
 
     if (mp4file)
@@ -1399,7 +1580,7 @@ static int faad_main(int argc, char *argv[])
 
         result = decodeAACfile(aacFileName, audioFileName, adtsFileName, writeToStdio,
             def_srate, object_type, outputFormat, format, downMatrix, infoOnly, adts_out,
-            old_format, &length);
+            old_format, &length, seekTo);
     }
 
     if (audioFileName != NULL)

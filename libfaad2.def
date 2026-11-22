@@ -13,3 +13,13 @@ NeAACDecGetErrorMessage           @8
 NeAACDecAudioSpecificConfig       @9
 NeAACDecPostSeekReset             @10
 NeAACDecDecode2                   @11
+NeAACDecReset                     @12
+NeAACDecADTSIndexCreate           @13
+NeAACDecADTSIndexDestroy          @14
+NeAACDecADTSIndexFrameCount       @15
+NeAACDecADTSIndexSampleCount      @16
+NeAACDecADTSIndexSampleRate       @17
+NeAACDecADTSIndexLocateSample     @18
+NeAACDecADTSIndexLocateTime       @19
+NeAACDecADTSIndexGetFrame         @20
+NeAACDecADTSSeek                  @21

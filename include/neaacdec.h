@@ -130,12 +130,130 @@ extern "C" {
 #define DRMCH_SBR_PS_STEREO 5
 
 
-/* A decode call can eat up to FAAD_MIN_STREAMSIZE bytes per decoded channel,
+/* FAAD_MIN_STREAMSIZE bytes per decoded channel,
    so at least so much bytes per channel should be available in this stream */
 #define FAAD_MIN_STREAMSIZE 768 /* 6144 bits/channel */
 
 
 typedef void *NeAACDecHandle;
+
+/* ADTS random access ----------------------------------------------------- */
+
+/* Status codes returned by the ADTS index/seek helpers. */
+#define NE_AAC_ADTS_OK            0
+#define NE_AAC_ADTS_ERR_INVALID   1 /* bad argument or not a valid ADTS stream */
+#define NE_AAC_ADTS_ERR_NOTFOUND  2 /* requested position is past the end */
+#define NE_AAC_ADTS_ERR_NOMEM     3 /* memory allocation failure */
+
+/*
+ * Opaque, immutable frame index of an ADTS byte stream.
+ *
+ * An index is built once by NeAACDecADTSIndexCreate() and may be shared
+ * concurrently between any number of threads.  It only references the
+ * caller-supplied bitstream buffer (it never modifies it); the buffer must
+ * stay alive and unchanged until NeAACDecADTSIndexDestroy() returns.
+ */
+typedef struct NeAACDecADTSIndexStruct *NeAACDecADTSIndex;
+
+/*
+ * Scan an ADTS byte stream and build its frame index.
+ *
+ * On success *index receives a newly allocated immutable index.  Leading
+ * non-sync data (e.g. ID3 tags) is skipped.  frame_count_out, when non-NULL,
+ * receives the number of indexed ADTS frames and samplerate_out the output
+ * sample rate in Hz (doubled for implicitly signalled SBR, matching the
+ * default decoder configuration).  The data buffer must outlive the index.
+ *
+ * The reported sample rate and samples-per-frame follow the default
+ * decoder convention used by NeAACDecInit()/NeAACDecOpen(): implicit SBR on
+ * a core rate at or below 24 kHz is upsampled (2048 samples/frame at twice
+ * the core rate).  Decode the stream with that default configuration for
+ * the index's sample positions to line up exactly with the PCM output.
+ */
+NEAACDECAPI unsigned char NeAACDecADTSIndexCreate(
+    const unsigned char *data,
+    unsigned long size,
+    NeAACDecADTSIndex *index,
+    unsigned long *frame_count_out,
+    unsigned long *samplerate_out);
+
+/* Release an index. Safe to call with NULL. */
+NEAACDECAPI void NeAACDecADTSIndexDestroy(NeAACDecADTSIndex index);
+
+/* Number of indexed frames. Returns 0 for a NULL index. */
+NEAACDECAPI unsigned long NeAACDecADTSIndexFrameCount(NeAACDecADTSIndex index);
+
+/* Total number of output samples per channel. Returns 0 for a NULL index. */
+NEAACDECAPI unsigned long NeAACDecADTSIndexSampleCount(NeAACDecADTSIndex index);
+
+/* Output sample rate in Hz. Returns 0 for a NULL index. */
+NEAACDECAPI unsigned long NeAACDecADTSIndexSampleRate(NeAACDecADTSIndex index);
+
+/*
+ * Map an output sample position (per channel) to the frame containing it.
+ * frame_out receives the frame number and frame_sample_offset_out the
+ * output sample position (per channel) at which that frame starts.
+ * Returns NE_AAC_ADTS_ERR_NOTFOUND when sample_position is past the end.
+ */
+NEAACDECAPI unsigned char NeAACDecADTSIndexLocateSample(
+    NeAACDecADTSIndex index,
+    unsigned long sample_position,
+    unsigned long *frame_out,
+    unsigned long *frame_sample_offset_out);
+
+/*
+ * Map a time in seconds to the frame containing it.
+ * frame_out receives the frame number and time_offset_out the time at
+ * which that frame starts, in seconds. Negative times are rejected.
+ */
+NEAACDECAPI unsigned char NeAACDecADTSIndexLocateTime(
+    NeAACDecADTSIndex index,
+    double time_seconds,
+    unsigned long *frame_out,
+    double *time_offset_out);
+
+/*
+ * Get the byte location of an indexed frame inside the original buffer.
+ * offset_out receives the offset of the ADTS syncword, length_out the
+ * complete frame length in bytes.
+ */
+NEAACDECAPI unsigned char NeAACDecADTSIndexGetFrame(
+    NeAACDecADTSIndex index,
+    unsigned long frame_number,
+    unsigned long *offset_out,
+    unsigned long *length_out);
+
+/*
+ * Rebuild decoder state so that the next NeAACDecDecode() call produces
+ * frame target_frame, bit-identically to a continuous from-zero decode.
+ *
+ * All frames before the target are decoded internally and discarded to
+ * reconstruct every stateful part of the decoder (overlap-add, predictors,
+ * SBR/PS, ...). target_sample_position is the requested sample position
+ * (per channel); it only needs to lie within the target frame. On return
+ * target_frame_out (if non-NULL) receives the frame containing it and
+ * skipped_samples_out the number of output samples per channel before that
+ * frame.
+ *
+ * The index is treated as read-only and may be shared across threads;
+ * each thread must use its own NeAACDecHandle.
+ */
+NEAACDECAPI unsigned char NeAACDecADTSSeek(
+    NeAACDecHandle decoder,
+    NeAACDecADTSIndex index,
+    unsigned long target_sample_position,
+    unsigned long *target_frame_out,
+    void *reserved,
+    unsigned long *skipped_samples_out);
+
+/*
+ * Tear down all per-stream state of a decoder handle so it can be
+ * re-initialised and reused (e.g. for another file or another seek).
+ * Equivalent to NeAACDecClose() followed by NeAACDecOpen(), but keeps the
+ * same handle address and preserves the current configuration.
+ * Safe to call with NULL.
+ */
+NEAACDECAPI void NeAACDecReset(NeAACDecHandle decoder);
 
 typedef struct mp4AudioSpecificConfig
 {

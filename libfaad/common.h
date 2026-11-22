@@ -410,6 +410,7 @@ uint32_t get_sample_rate(const uint8_t sr_index);
 int8_t can_decode_ot(const uint8_t object_type);
 
 void *faad_malloc(size_t size);
+void *faad_realloc(void *ptr, size_t size);
 void faad_free(void *b);
 
 //#define PROFILE

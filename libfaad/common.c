@@ -179,6 +179,10 @@ void *faad_malloc(size_t size)
     return malloc(size);
 #endif  // #ifdef 0
 }
+void *faad_realloc(void *ptr, size_t size)
+{
+    return realloc(ptr, size);
+}
 
 /* common free function */
 void faad_free(void *b)

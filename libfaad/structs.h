@@ -439,6 +439,10 @@ typedef struct
 	const unsigned char *cmes;
 } NeAACDecStruct;
 
+/* Internal lifecycle helpers shared by decoder.c and adts_seek.c.
+ * Not part of the public API. */
+void NeAACDecFreeResources(NeAACDecStruct *hDecoder);
+void NeAACDecInitDefaults(NeAACDecStruct *hDecoder);
 
 
 #ifdef __cplusplus

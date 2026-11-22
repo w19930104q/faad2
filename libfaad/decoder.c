@@ -67,68 +67,56 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
 static void create_channel_config(NeAACDecStruct *hDecoder,
                                   NeAACDecFrameInfo *hInfo);
 
-
-int NeAACDecGetVersion(char **faad_id_string,
-                                   char **faad_copyright_string)
-{
-    static char *libfaadName = PACKAGE_VERSION;
-    static char *libCopyright =
-        " Copyright 2002-2004: Ahead Software AG\n"
-	" http://www.audiocoding.com\n"
-	" bug tracking: https://sourceforge.net/p/faac/bugs/\n";
-
-    if (faad_id_string)
-        *faad_id_string = libfaadName;
-
-    if (faad_copyright_string)
-        *faad_copyright_string = libCopyright;
-
-    return 0;
-}
-
-char* NeAACDecGetErrorMessage(unsigned char errcode)
-{
-    if (errcode >= NUM_ERROR_MESSAGES)
-        return NULL;
-    return err_msg[errcode];
-}
-
-unsigned long NeAACDecGetCapabilities(void)
-{
-    uint32_t cap = 0;
-
-    /* can't do without it */
-    cap += LC_DEC_CAP;
-
-#ifdef MAIN_DEC
-    cap += MAIN_DEC_CAP;
-#endif
-#ifdef LTP_DEC
-    cap += LTP_DEC_CAP;
-#endif
-#ifdef LD_DEC
-    cap += LD_DEC_CAP;
-#endif
-#ifdef ERROR_RESILIENCE
-    cap += ERROR_RESILIENCE_CAP;
-#endif
-#ifdef FIXED_POINT
-    cap += FIXED_POINT_CAP;
-#endif
-
-    return cap;
-}
-
 const unsigned char mes[] = { 0x67,0x20,0x61,0x20,0x20,0x20,0x6f,0x20,0x72,0x20,0x65,0x20,0x6e,0x20,0x20,0x20,0x74,0x20,0x68,0x20,0x67,0x20,0x69,0x20,0x72,0x20,0x79,0x20,0x70,0x20,0x6f,0x20,0x63 };
-NeAACDecHandle NeAACDecOpen(void)
+
+/* Release every per-stream resource owned by the handle but keep the
+ * handle allocation itself.  Shared with NeAACDecClose() and the internal
+ * reset path used by ADTS random access. */
+void NeAACDecFreeResources(NeAACDecStruct *hDecoder)
 {
     uint8_t i;
-    NeAACDecStruct *hDecoder = NULL;
 
-    if ((hDecoder = (NeAACDecStruct*)faad_malloc(sizeof(NeAACDecStruct))) == NULL)
-        return NULL;
+    for (i = 0; i < MAX_CHANNELS; i++)
+    {
+        if (hDecoder->time_out[i]) faad_free(hDecoder->time_out[i]);
+        if (hDecoder->fb_intermed[i]) faad_free(hDecoder->fb_intermed[i]);
+#ifdef SSR_DEC
+        if (hDecoder->ssr_overlap[i]) faad_free(hDecoder->ssr_overlap[i]);
+        if (hDecoder->prev_fmd[i]) faad_free(hDecoder->prev_fmd[i]);
+#endif
+#ifdef MAIN_DEC
+        if (hDecoder->pred_stat[i]) faad_free(hDecoder->pred_stat[i]);
+#endif
+#ifdef LTP_DEC
+        if (hDecoder->lt_pred_stat[i]) faad_free(hDecoder->lt_pred_stat[i]);
+#endif
+    }
 
-    memset(hDecoder, 0, sizeof(NeAACDecStruct));
+#ifdef SSR_DEC
+    if (hDecoder->object_type == SSR)
+        ssr_filter_bank_end(hDecoder->fb);
+    else
+#endif
+        filter_bank_end(hDecoder->fb);
+
+    drc_end(hDecoder->drc);
+
+    if (hDecoder->sample_buffer) faad_free(hDecoder->sample_buffer);
+
+#ifdef SBR_DEC
+    for (i = 0; i < MAX_SYNTAX_ELEMENTS; i++)
+    {
+        if (hDecoder->sbr[i])
+            sbrDecodeEnd(hDecoder->sbr[i]);
+    }
+#endif
+}
+
+/* Initialise the per-handle defaults of a zeroed struct.  Mirrors the setup
+ * in NeAACDecOpen(); the configuration is set separately afterwards. */
+void NeAACDecInitDefaults(NeAACDecStruct *hDecoder)
+{
+    uint8_t i;
 
     hDecoder->cmes = mes;
     hDecoder->config.outputFormat  = FAAD_FMT_16BIT;
@@ -182,6 +170,70 @@ NeAACDecHandle NeAACDecOpen(void)
 #if (defined(PS_DEC) || defined(DRM_PS))
     hDecoder->ps_present_flag = -1;
 #endif
+}
+
+
+int NeAACDecGetVersion(char **faad_id_string,
+                                   char **faad_copyright_string)
+{
+    static char *libfaadName = PACKAGE_VERSION;
+    static char *libCopyright =
+        " Copyright 2002-2004: Ahead Software AG\n"
+	" http://www.audiocoding.com\n"
+	" bug tracking: https://sourceforge.net/p/faac/bugs/\n";
+
+    if (faad_id_string)
+        *faad_id_string = libfaadName;
+
+    if (faad_copyright_string)
+        *faad_copyright_string = libCopyright;
+
+    return 0;
+}
+
+char* NeAACDecGetErrorMessage(unsigned char errcode)
+{
+    if (errcode >= NUM_ERROR_MESSAGES)
+        return NULL;
+    return err_msg[errcode];
+}
+
+unsigned long NeAACDecGetCapabilities(void)
+{
+    uint32_t cap = 0;
+
+    /* can't do without it */
+    cap += LC_DEC_CAP;
+
+#ifdef MAIN_DEC
+    cap += MAIN_DEC_CAP;
+#endif
+#ifdef LTP_DEC
+    cap += LTP_DEC_CAP;
+#endif
+#ifdef LD_DEC
+    cap += LD_DEC_CAP;
+#endif
+#ifdef ERROR_RESILIENCE
+    cap += ERROR_RESILIENCE_CAP;
+#endif
+#ifdef FIXED_POINT
+    cap += FIXED_POINT_CAP;
+#endif
+
+    return cap;
+}
+
+NeAACDecHandle NeAACDecOpen(void)
+{
+    NeAACDecStruct *hDecoder = NULL;
+
+    if ((hDecoder = (NeAACDecStruct*)faad_malloc(sizeof(NeAACDecStruct))) == NULL)
+        return NULL;
+
+    memset(hDecoder, 0, sizeof(NeAACDecStruct));
+
+    NeAACDecInitDefaults(hDecoder);
 
     return hDecoder;
 }
@@ -520,7 +572,6 @@ char NeAACDecInitDRM(NeAACDecHandle *hpDecoder,
 
 void NeAACDecClose(NeAACDecHandle hpDecoder)
 {
-    uint8_t i;
     NeAACDecStruct* hDecoder = (NeAACDecStruct*)hpDecoder;
 
     if (hDecoder == NULL)
@@ -534,42 +585,26 @@ void NeAACDecClose(NeAACDecHandle hpDecoder)
     printf("output:             %I64d cycles\n", hDecoder->output_cycles);
 #endif
 
-    for (i = 0; i < MAX_CHANNELS; i++)
-    {
-        if (hDecoder->time_out[i]) faad_free(hDecoder->time_out[i]);
-        if (hDecoder->fb_intermed[i]) faad_free(hDecoder->fb_intermed[i]);
-#ifdef SSR_DEC
-        if (hDecoder->ssr_overlap[i]) faad_free(hDecoder->ssr_overlap[i]);
-        if (hDecoder->prev_fmd[i]) faad_free(hDecoder->prev_fmd[i]);
-#endif
-#ifdef MAIN_DEC
-        if (hDecoder->pred_stat[i]) faad_free(hDecoder->pred_stat[i]);
-#endif
-#ifdef LTP_DEC
-        if (hDecoder->lt_pred_stat[i]) faad_free(hDecoder->lt_pred_stat[i]);
-#endif
-    }
-
-#ifdef SSR_DEC
-    if (hDecoder->object_type == SSR)
-        ssr_filter_bank_end(hDecoder->fb);
-    else
-#endif
-        filter_bank_end(hDecoder->fb);
-
-    drc_end(hDecoder->drc);
-
-    if (hDecoder->sample_buffer) faad_free(hDecoder->sample_buffer);
-
-#ifdef SBR_DEC
-    for (i = 0; i < MAX_SYNTAX_ELEMENTS; i++)
-    {
-        if (hDecoder->sbr[i])
-            sbrDecodeEnd(hDecoder->sbr[i]);
-    }
-#endif
+    NeAACDecFreeResources(hDecoder);
 
     if (hDecoder) faad_free(hDecoder);
+}
+
+void NeAACDecReset(NeAACDecHandle hpDecoder)
+{
+    NeAACDecConfiguration saved;
+    NeAACDecStruct *hDecoder = (NeAACDecStruct*)hpDecoder;
+
+    if (hDecoder == NULL)
+        return;
+
+    /* The configuration is owned by the handle and must survive the reset. */
+    saved = hDecoder->config;
+
+    NeAACDecFreeResources(hDecoder);
+    memset(hDecoder, 0, sizeof(NeAACDecStruct));
+    NeAACDecInitDefaults(hDecoder);
+    hDecoder->config = saved;
 }
 
 void NeAACDecPostSeekReset(NeAACDecHandle hpDecoder, long frame)
