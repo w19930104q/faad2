@@ -264,6 +264,18 @@ if (FAAD_BUILD_CLI)
   else()
     set_target_properties(faad_cli PROPERTIES OUTPUT_NAME faad)
   endif()
+
+  # Chapter-reading acceptance tests. The MP4 fixtures are regenerated from a
+  # deterministic FFmpeg recipe; a checked-in copy lives under tests/data so
+  # the suite also runs without FFmpeg installed.
+  enable_testing()
+  add_test(
+    NAME chapters
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bin/test_chapters.sh
+  )
+  set_tests_properties(chapters PROPERTIES
+    ENVIRONMENT "FAAD=$<TARGET_FILE:faad_cli>"
+  )
 endif()
 # Installation
 

@@ -90,6 +90,103 @@ static void faad_fprintf(FILE *stream, const char *fmt, ...)
 #endif
 }
 
+/* ------------------------------------------------------------------ */
+/* Chapter listing and CUE sheet export                                */
+/* ------------------------------------------------------------------ */
+
+/* Format a nanosecond offset as MM:SS:FF (75 fps CUE frames). */
+static void cue_timestamp(uint64_t ns, char *out, size_t outsz)
+{
+    /* Divide first to avoid overflowing the 75x intermediate. */
+    uint64_t total_frames = (ns / 1000000000ull) * 75ull
+                          + ((ns % 1000000000ull) * 75ull) / 1000000000ull;
+    unsigned int frames = (unsigned int)(total_frames % 75u);
+    unsigned int seconds = (unsigned int)((total_frames / 75u) % 60u);
+    unsigned int minutes = (unsigned int)(total_frames / (75u * 60u));
+    snprintf(out, outsz, "%02u:%02u:%02u", minutes, seconds, frames);
+}
+
+/* List the chapter table: index, start time and UTF-8 title. */
+static void print_chapters(void)
+{
+    uint32_t count = mp4read_chapter_count();
+    uint32_t i;
+
+    printf("Chapters: %u\n", count);
+    for (i = 0; i < count; i++)
+    {
+        const mp4chapter_t *ch = mp4read_chapter_get(i);
+        unsigned long long sec;
+        unsigned int m, s, frac;
+
+        if (!ch)
+            continue;
+        sec = ch->start_ns / 1000000000ull;
+        m = (unsigned int)(sec / 60ull);
+        s = (unsigned int)(sec % 60ull);
+        frac = (unsigned int)((ch->start_ns % 1000000000ull)
+                              / 10000000ull); /* tenths */
+        printf("%3u  %02u:%02u.%u  %s\n", i + 1, m, s, frac, ch->title);
+    }
+}
+
+/*
+ * Emit a CUE sheet. Titles are copied verbatim; embedded double quotes are
+ * escaped per the CUE sheet convention.
+ */
+static void cue_escape(FILE *f, const char *s)
+{
+    for (; *s; s++)
+    {
+        if (*s == '"')
+            fputc('\\', f);
+        fputc((unsigned char)*s, f);
+    }
+}
+
+static int write_cuesheet(const char *path, const char *audiofile)
+{
+    FILE *f;
+    uint32_t count = mp4read_chapter_count();
+    uint32_t i;
+
+    if (path)
+    {
+        f = faad_fopen(path, "wb");
+        if (!f)
+        {
+            faad_fprintf(stderr, "Error opening cuesheet file: %s\n", path);
+            return 1;
+        }
+    }
+    else
+    {
+        f = stdout;
+    }
+
+    fprintf(f, "REM GENERATOR faad2 chapter export\n");
+    fprintf(f, "FILE \"%s\" AUDIO\n", audiofile ? audiofile : "");
+    for (i = 0; i < count; i++)
+    {
+        const mp4chapter_t *ch = mp4read_chapter_get(i);
+        char ts[16];
+
+        if (!ch)
+            continue;
+        cue_timestamp(ch->start_ns, ts, sizeof(ts));
+        fprintf(f, "  TRACK %02u AUDIO\n", i + 1);
+        fprintf(f, "    TITLE \"");
+        cue_escape(f, ch->title);
+        fprintf(f, "\"\n");
+        fprintf(f, "    INDEX 01 %s\n", ts);
+    }
+
+    if (f != stdout)
+        fclose(f);
+    return 0;
+}
+
+
 /* FAAD file buffering routines */
 typedef struct {
     unsigned long bytes_into_buffer;
@@ -433,6 +530,9 @@ static void usage(void)
     faad_fprintf(stdout, " -g    Disable gapless decoding.\n");
     faad_fprintf(stdout, " -q    Quiet - suppresses status messages.\n");
     faad_fprintf(stdout, " -j X  Jump - start output X seconds into track (MP4 files only).\n");
+    faad_fprintf(stdout, " -C    List the MP4 chapter table (index, start time, title).\n");
+    faad_fprintf(stdout, " -c X  Export a CUE sheet to X (or stdout when X is '-').\n");
+    faad_fprintf(stdout, "       MP4 files only; an empty chapter table is exported if none.\n");
     faad_fprintf(stdout, "Example:\n");
     faad_fprintf(stdout, "       %s infile.aac\n", progName);
     faad_fprintf(stdout, "       %s infile.mp4\n", progName);
@@ -1100,6 +1200,8 @@ static int faad_main(int argc, char *argv[])
     int showHelp = 0;
     int mp4file = 0;
     int noGapless = 0;
+    int listChapters = 0;
+    char *cueFileName = NULL;
     char *fnp;
     char *aacFileName = NULL;
     char *audioFileName = NULL;
@@ -1140,11 +1242,13 @@ static int faad_main(int argc, char *argv[])
             { "info",       0, 0, 'i' },
             { "stdio",      0, 0, 'w' },
             { "seek",       1, 0, 'j' },
+            { "chapters",   0, 0, 'C' },
+            { "cuesheet",   1, 0, 'c' },
             { "help",       0, 0, 'h' },
             { 0, 0, 0, 0 }
         };
 
-        c = getopt_long(argc, argv, "o:a:s:f:b:l:j:wgdhitq",
+        c = getopt_long(argc, argv, "o:a:s:f:b:l:j:c:wgdhitqC",
             long_options, &option_index);
 
         if (c == -1)
@@ -1256,6 +1360,21 @@ static int faad_main(int argc, char *argv[])
             break;
         case 'g':
             noGapless = 1;
+            break;
+        case 'C':
+            listChapters = 1;
+            break;
+        case 'c':
+            if (optarg)
+            {
+                cueFileName = (char *) malloc(sizeof(char) * (strlen(optarg) + 1));
+                if (cueFileName == NULL)
+                {
+                    faad_fprintf(stderr, "Error allocating memory for cueFileName.\n");
+                    return 1;
+                }
+                strcpy(cueFileName, optarg);
+            }
             break;
         case 'i':
             infoOnly = 1;
@@ -1370,6 +1489,12 @@ static int faad_main(int argc, char *argv[])
 
     if (bread != 8) {
         faad_fprintf(stderr, "Error reading file.\n");
+        free(aacFileName);
+        free(cueFileName);
+        if (audioFileName != NULL)
+            free(audioFileName);
+        if (adtsFileName != NULL)
+            free(adtsFileName);
         return 1;
     }
 
@@ -1378,6 +1503,44 @@ static int faad_main(int argc, char *argv[])
 
     if (!mp4file && seekTo != 0) {
         faad_fprintf(stderr, "Warning: can only seek in MP4 files\n");
+    }
+    if (!mp4file && (listChapters || cueFileName)) {
+        faad_fprintf(stderr, "Warning: chapter operations are only supported for MP4 files\n");
+    }
+
+    /* Chapter operations only apply to MP4 containers. */
+    if (mp4file && (listChapters || cueFileName))
+    {
+        if (mp4read_open(aacFileName))
+        {
+            faad_fprintf(stderr, "Error opening file: %s\n", aacFileName);
+            free(aacFileName);
+            free(cueFileName);
+            if (audioFileName != NULL)
+                free(audioFileName);
+            if (adtsFileName != NULL)
+                free(adtsFileName);
+            return 1;
+        }
+        if (listChapters)
+            print_chapters();
+        if (cueFileName)
+        {
+            const char *cue_path = (strcmp(cueFileName, "-") == 0) ? NULL : cueFileName;
+            result = write_cuesheet(cue_path, aacFileName);
+        }
+        else
+        {
+            result = 0;
+        }
+        mp4read_close();
+        free(aacFileName);
+        free(cueFileName);
+        if (audioFileName != NULL)
+            free(audioFileName);
+        if (adtsFileName != NULL)
+            free(adtsFileName);
+        return result;
     }
 
     if (mp4file)
@@ -1406,6 +1569,8 @@ static int faad_main(int argc, char *argv[])
       free (audioFileName);
     if (adtsFileName != NULL)
       free (adtsFileName);
+    if (cueFileName != NULL)
+      free (cueFileName);
 
     if (!result && !infoOnly)
     {

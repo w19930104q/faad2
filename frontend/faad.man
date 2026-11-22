@@ -77,6 +77,21 @@ Sets the processing to use the old MPEG\(hy4 AAC ADTS format when outputting in 
 .TP
 .B \-w ", \-\^\-stdio"
 Sets the processing output to be sent to the standard out.
+.TP
+.B \-C ", \-\^\-chapters"
+Lists the chapter table embedded in an MP4 container. For every chapter the
+1\-based index, start time (MM:SS.t) and UTF\-8 title are printed. A file
+without chapters prints "Chapters: 0" and succeeds. No audio is decoded.
+.TP
+.BI \-c " <filename>" ", \-\^\-cuesheet" " <filename>"
+Exports the MP4 chapter table as a CUE sheet to
+.IR filename .
+Use
+.B \-
+as the filename to write the sheet to standard output. Chapter start times
+are converted to the CUE 75\-frames\-per\-second timebase (MM:SS:FF). An
+empty chapter table yields a sheet containing only the header. No audio is
+decoded.
 
 .SH "AUTHOR"
 Matthew W. S. Bell <matthew (at) bells23.org.uk>

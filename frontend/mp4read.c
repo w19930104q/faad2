@@ -103,6 +103,539 @@ static int u8in(void)
     return u8;
 }
 
+/* big-endian on-disk uint32 to host order (all MP4 integers are big-endian) */
+static uint32_t byte_swap32(uint32_t v)
+{
+    return ((v & 0x000000ffu) << 24) |
+           ((v & 0x0000ff00u) << 8) |
+           ((v & 0x00ff0000u) >> 8) |
+           ((v & 0xff000000u) >> 24);
+}
+
+/* ------------------------------------------------------------------ */
+/* Chapter handling                                                    */
+/*                                                                     */
+/* Apple "chpl" timestamps use a fixed 100-nanosecond timescale.       */
+#define CHPL_TIMESTAMP_NS 100u
+
+static void chapters_clear(void)
+{
+    uint32_t i;
+
+    if (!mp4config.chapters.items)
+        return;
+
+    for (i = 0; i < mp4config.chapters.count; i++)
+        free(mp4config.chapters.items[i].title);
+    free(mp4config.chapters.items);
+    mp4config.chapters.items = NULL;
+    mp4config.chapters.count = 0;
+}
+
+/* Allocate (or replace) an empty chapter table of count entries. */
+static int chapters_alloc(uint32_t count)
+{
+    chapters_clear();
+    if (count == 0)
+        return ERR_OK;
+    if (count > UINT32_MAX / sizeof(mp4chapter_t))
+        return ERR_FAIL;
+
+    mp4config.chapters.items = calloc(count, sizeof(mp4chapter_t));
+    if (!mp4config.chapters.items)
+        return ERR_FAIL;
+    mp4config.chapters.count = count;
+    return ERR_OK;
+}
+
+/* Read one length-prefixed UTF-8 string: 1-byte length followed by bytes. */
+static char *pstr8in(uint32_t *remaining)
+{
+    int len;
+    char *str;
+
+    if (*remaining < 1)
+        return NULL;
+    len = u8in();
+    (*remaining)--;
+    if ((uint32_t)len > *remaining)
+        return NULL;
+
+    str = malloc((size_t)len + 1);
+    if (!str)
+        return NULL;
+    if (len > 0 && datain(str, (size_t)len) != (size_t)len)
+    {
+        free(str);
+        return NULL;
+    }
+    str[len] = '\0';
+    *remaining -= (uint32_t)len;
+    return str;
+}
+
+/*
+ * Apple QuickTime chapter list atom ("chpl"), located under moov/udta
+ * (either directly as udta/chpl or inside udta/meta/chpl).
+ * Layout as emitted by the FFmpeg MP4 muxer and Apple tooling:
+ *   version (1 byte), flags (3), reserved (4), chapter_count (1), then for
+ *   every chapter: timestamp (8, units of 100 ns), name_len (1), name (UTF-8).
+ */
+static int chplin(int size)
+{
+    uint32_t remaining;
+    uint32_t count;
+    uint32_t i;
+    int err;
+
+    if (size < 9)
+        return ERR_FAIL;
+
+    /* version/flags + reserved */
+    u32in();
+    u32in();
+    count = (uint32_t)u8in();
+    remaining = (uint32_t)size - 9;
+
+    err = chapters_alloc(count);
+    if (err < ERR_OK)
+        return err;
+
+    for (i = 0; i < count; i++)
+    {
+        uint64_t ts100ns;
+        uint32_t hi, lo;
+        char *title;
+
+        if (remaining < 9)
+            goto fail;
+        hi = u32in();
+        lo = u32in();
+        ts100ns = ((uint64_t)hi << 32) | lo;
+        remaining -= 8;
+
+        title = pstr8in(&remaining);
+        if (!title)
+            goto fail;
+
+        /* 100 ns units -> ns; saturate instead of wrapping on overflow. */
+        if (ts100ns > UINT64_MAX / CHPL_TIMESTAMP_NS)
+            mp4config.chapters.items[i].start_ns = UINT64_MAX;
+        else
+            mp4config.chapters.items[i].start_ns = ts100ns * CHPL_TIMESTAMP_NS;
+        mp4config.chapters.items[i].title = title;
+    }
+
+    return size;
+
+fail:
+    chapters_clear();
+    return ERR_FAIL;
+}
+
+/* ---- ISO/IEC 14496-12 chapter reference (text track) fallback ---- */
+
+/*
+ * The generic recursive parser above is tailored to the single sound track.
+ * The chapter fallback therefore walks atoms manually with the small set of
+ * helpers below; it never touches the audio parsing state.
+ */
+
+/* Read the atom header at the current file position. */
+static int atom_head(uint32_t *hdr_size, uint32_t *atom_size, char name[4])
+{
+    uint32_t size;
+
+    if (datain(&size, 4) != 4)
+        return ERR_FAIL;
+    size = byte_swap32(size);
+    if (datain(name, 4) != 4)
+        return ERR_FAIL;
+    if (size < 8)
+        return ERR_FAIL;
+    if (size == 1)
+    {
+        uint32_t hi, lo;
+        if (datain(&hi, 4) != 4 || datain(&lo, 4) != 4)
+            return ERR_FAIL;
+        if (hi != 0)
+            return ERR_FAIL; /* atoms above 4 GiB are not supported */
+        size = lo;
+        *hdr_size = 16;
+    }
+    else
+    {
+        *hdr_size = 8;
+    }
+    if (size < *hdr_size)
+        return ERR_FAIL;
+    *atom_size = size;
+    return ERR_OK;
+}
+
+/*
+ * Find a direct child atom named want inside [pos, pos+region_size).
+ * On success returns ERR_OK with the file positioned at the child payload and
+ * stores the payload size in *found_size.
+ */
+static int atom_find(long pos, uint32_t region_size, const char want[4],
+                     uint32_t *found_size)
+{
+    long end = (long)pos + region_size;
+    long cur = pos;
+
+    while (cur + 8 <= end)
+    {
+        uint32_t hdr_size, atom_size;
+        char name[4];
+
+        if (fseek(g_fin, cur, SEEK_SET))
+            return ERR_FAIL;
+        if (atom_head(&hdr_size, &atom_size, name) < ERR_OK)
+            return ERR_FAIL;
+        if (!memcmp(name, want, 4))
+        {
+            if (atom_size > end - cur)
+                return ERR_FAIL;
+            *found_size = atom_size - hdr_size;
+            /* file is already positioned right after the header */
+            return ERR_OK;
+        }
+        cur += atom_size;
+    }
+    return ERR_FAIL;
+}
+
+typedef struct
+{
+    uint32_t timescale;
+    uint32_t sample_count;
+    uint32_t *sample_sizes;   /* one entry per text sample */
+    uint32_t *sample_deltas;  /* one media-time delta per sample */
+    uint32_t chunk_offset;    /* single chunk holding all samples */
+} chapter_track_t;
+
+static void chapter_track_free(chapter_track_t *ct)
+{
+    free(ct->sample_sizes);
+    free(ct->sample_deltas);
+    ct->sample_sizes = NULL;
+    ct->sample_deltas = NULL;
+}
+
+/* Parse an mdhd payload; only the media timescale is required. */
+static int mdhd_timescale(uint32_t size, uint32_t *timescale)
+{
+    uint8_t version;
+
+    if (size < 20)
+        return ERR_FAIL;
+    version = (uint8_t)u8in();
+    u8in(); u8in(); u8in(); /* flags */
+
+    if (version == 1)
+    {
+        if (size < 32)
+            return ERR_FAIL;
+        u32in(); u32in(); /* creation time */
+        u32in(); u32in(); /* modification time */
+        *timescale = u32in();
+    }
+    else
+    {
+        u32in(); /* creation time */
+        u32in(); /* modification time */
+        *timescale = u32in();
+    }
+    return (*timescale == 0) ? ERR_FAIL : ERR_OK;
+}
+
+/* Expand the stts run-length table into one delta per sample. */
+static int stts_deltas(uint32_t size, chapter_track_t *ct)
+{
+    uint32_t entries, i, n;
+
+    if (size < 8)
+        return ERR_FAIL;
+    u32in(); /* version/flags */
+    entries = u32in();
+    if (entries == 0 || ((size - 8u) / 8u) < entries)
+        return ERR_FAIL;
+    if (entries > UINT32_MAX / sizeof(uint32_t))
+        return ERR_FAIL;
+
+    ct->sample_count = 0;
+    for (i = 0; i < entries; i++)
+    {
+        uint32_t run = u32in();
+        u32in(); /* sample delta */
+        if (run > UINT32_MAX - ct->sample_count)
+            return ERR_FAIL;
+        ct->sample_count += run;
+    }
+    if (ct->sample_count == 0)
+        return ERR_FAIL;
+
+    ct->sample_deltas = malloc(ct->sample_count * sizeof(uint32_t));
+    if (!ct->sample_deltas)
+        return ERR_FAIL;
+
+    if (fseek(g_fin, -((long)entries * 8 + 8), SEEK_CUR))
+    {
+        free(ct->sample_deltas);
+        ct->sample_deltas = NULL;
+        return ERR_FAIL;
+    }
+    u32in(); /* version/flags */
+    entries = u32in();
+    n = 0;
+    for (i = 0; i < entries; i++)
+    {
+        uint32_t run = u32in();
+        uint32_t delta = u32in();
+        uint32_t j;
+        for (j = 0; j < run && n < ct->sample_count; j++)
+            ct->sample_deltas[n++] = delta;
+    }
+    if (n != ct->sample_count)
+        return ERR_FAIL;
+    return ERR_OK;
+}
+
+static int stsz_sizes(uint32_t size, chapter_track_t *ct)
+{
+    uint32_t uniform, count, i;
+
+    if (size < 12)
+        return ERR_FAIL;
+    u32in(); /* version/flags */
+    uniform = u32in();
+    count = u32in();
+    if (uniform != 0)
+        return ERR_FAIL; /* text samples carry individual lengths */
+    if (count == 0 || count != ct->sample_count)
+        return ERR_FAIL;
+    if ((size - 12u) / 4u < count)
+        return ERR_FAIL;
+
+    ct->sample_sizes = malloc(count * sizeof(uint32_t));
+    if (!ct->sample_sizes)
+        return ERR_FAIL;
+    for (i = 0; i < count; i++)
+        ct->sample_sizes[i] = u32in();
+    return ERR_OK;
+}
+
+static int stco_offset(uint32_t size, chapter_track_t *ct)
+{
+    uint32_t entries;
+
+    if (size < 8)
+        return ERR_FAIL;
+    u32in(); /* version/flags */
+    entries = u32in();
+    if (entries < 1 || ((size - 8u) / 4u) < entries)
+        return ERR_FAIL;
+    ct->chunk_offset = u32in(); /* chapter tracks use a single chunk */
+    return ERR_OK;
+}
+
+/*
+ * Decode one chapter text sample into a freshly allocated UTF-8 title.
+ * Both common layouts are accepted:
+ *  - ISO "text": a 2-byte length prefix followed by the raw string;
+ *  - QuickTime styled text: a 2-byte length prefix, a 16-byte header block
+ *    and then the string itself.
+ */
+/*
+ * Decode one chapter text sample into a freshly allocated UTF-8 title.
+ *
+ * The ISO/IEC 14496-12 "text" sample layout is a 2-byte big-endian length
+ * followed by exactly that many bytes of string; any remaining bytes are
+ * optional sub-atoms (e.g. the 12-byte "encd" extension FFmpeg appends) and
+ * are ignored. QuickTime styled-text samples start with a 16-byte header
+ * block after the length prefix; they are detected by the presence of a
+ * known sub-atom signature right where the plain string would begin.
+ */
+static char *text_sample_title(const uint8_t *buf, uint32_t size)
+{
+    uint16_t len;
+    uint32_t text_off, text_len;
+    char *title;
+
+    if (size < 2)
+        return NULL;
+    len = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]);
+    if (len == 0)
+        return NULL;
+    if ((uint32_t)len + 2u > size)
+        return NULL;
+
+    /* QuickTime styled text: 16-byte header precedes the actual string. */
+    if (len >= 16 && size >= 18u &&
+        (memcmp(buf + 2, "encd", 4) == 0 ||
+         memcmp(buf + 2, "styl", 4) == 0 ||
+         memcmp(buf + 2, "ftab", 4) == 0))
+    {
+        text_off = 18;
+        text_len = (uint32_t)len - 16u;
+        if (text_len == 0 || text_off + text_len > size)
+            return NULL;
+    }
+    else
+    {
+        /* Plain ISO text: the length counts the string bytes directly. */
+        text_off = 2;
+        text_len = len;
+    }
+
+    title = malloc((size_t)text_len + 1);
+    if (!title)
+        return NULL;
+    memcpy(title, buf + text_off, text_len);
+    title[text_len] = '\0';
+    return title;
+}
+
+/* Parse one non-sound chapter track given its "trak" atom position/size. */
+static int chapter_track_parse(long trak_pos, uint32_t trak_size)
+{
+    chapter_track_t ct;
+    uint32_t mdia_size, minf_size, stbl_size, payload;
+    long mdia_pos, minf_pos, stbl_pos;
+    uint64_t elapsed = 0;
+    uint32_t i;
+
+    memset(&ct, 0, sizeof(ct));
+
+    /* Skip the trak atom's own 8-byte header to reach its children. */
+    if (atom_find(trak_pos + 8, trak_size - 8, "mdia", &mdia_size) < ERR_OK)
+        return ERR_FAIL;
+    mdia_pos = ftell(g_fin);
+    if (atom_find(mdia_pos, mdia_size, "mdhd", &payload) < ERR_OK)
+        return ERR_FAIL;
+    if (mdhd_timescale(payload, &ct.timescale) < ERR_OK)
+        return ERR_FAIL;
+    if (atom_find(mdia_pos, mdia_size, "minf", &minf_size) < ERR_OK)
+        return ERR_FAIL;
+    minf_pos = ftell(g_fin);
+    if (atom_find(minf_pos, minf_size, "stbl", &stbl_size) < ERR_OK)
+        return ERR_FAIL;
+    stbl_pos = ftell(g_fin);
+
+    if (atom_find(stbl_pos, stbl_size, "stts", &payload) < ERR_OK)
+        goto fail;
+    if (stts_deltas(payload, &ct) < ERR_OK)
+        goto fail;
+    if (atom_find(stbl_pos, stbl_size, "stsz", &payload) < ERR_OK)
+        goto fail;
+    if (stsz_sizes(payload, &ct) < ERR_FAIL)
+        goto fail;
+    if (atom_find(stbl_pos, stbl_size, "stco", &payload) < ERR_OK)
+        goto fail;
+    if (stco_offset(payload, &ct) < ERR_OK)
+        goto fail;
+
+    if (chapters_alloc(ct.sample_count) < ERR_OK)
+        goto fail;
+
+    if (fseek(g_fin, (long)ct.chunk_offset, SEEK_SET))
+        goto fail;
+
+    for (i = 0; i < ct.sample_count; i++)
+    {
+        uint8_t *buf;
+        char *title;
+
+        if (ct.sample_sizes[i] == 0 || ct.sample_sizes[i] > 16 * 1024)
+            goto fail;
+        buf = malloc(ct.sample_sizes[i]);
+        if (!buf)
+            goto fail;
+        if (datain(buf, ct.sample_sizes[i]) != ct.sample_sizes[i])
+        {
+            free(buf);
+            goto fail;
+        }
+        title = text_sample_title(buf, ct.sample_sizes[i]);
+        free(buf);
+        if (!title)
+            goto fail;
+
+        /*
+         * Media time -> movie time in nanoseconds. Divide before multiplying
+         * to keep the intermediate bounded; the sub-tick remainder is below
+         * one timescale tick and therefore below one nanosecond of error.
+         */
+        mp4config.chapters.items[i].start_ns =
+            (elapsed / ct.timescale) * 1000000000ull
+            + ((elapsed % ct.timescale) * 1000000000ull) / ct.timescale;
+        mp4config.chapters.items[i].title = title;
+        if (elapsed > UINT64_MAX - ct.sample_deltas[i])
+            elapsed = UINT64_MAX;
+        else
+            elapsed += ct.sample_deltas[i];
+    }
+
+    chapter_track_free(&ct);
+    return ERR_OK;
+
+fail:
+    chapter_track_free(&ct);
+    chapters_clear();
+    return ERR_FAIL;
+}
+
+/*
+ * Scan the tracks inside moov for a chapter text track. Sound tracks are
+ * skipped via their hdlr handler type; every other track is tried and the
+ * first one that yields a valid chapter table wins.
+ */
+static int chapters_from_tracks(long moov_pos, uint32_t moov_size)
+{
+    long moov_end = (long)moov_pos + moov_size;
+    long pos = moov_pos;
+
+    while (pos + 8 <= moov_end)
+    {
+        uint32_t hdr_size, trak_size;
+        char name[4];
+
+        if (fseek(g_fin, pos, SEEK_SET))
+            return ERR_FAIL;
+        if (atom_head(&hdr_size, &trak_size, name) < ERR_OK)
+            return ERR_FAIL;
+        if ((long)pos + trak_size > moov_end)
+            return ERR_FAIL;
+
+        if (!memcmp(name, "trak", 4))
+        {
+            uint32_t mdia_size, hdlr_size;
+            long mdia_pos;
+
+            if (atom_find(pos + hdr_size, trak_size - hdr_size,
+                          "mdia", &mdia_size) >= ERR_OK)
+            {
+                mdia_pos = ftell(g_fin);
+                if (atom_find(mdia_pos, mdia_size, "hdlr", &hdlr_size)
+                        >= ERR_OK && hdlr_size >= 20)
+                {
+                    uint8_t hdr[12];
+                    if (datain(hdr, 12) == 12 &&
+                        memcmp(hdr + 8, "soun", 4) != 0)
+                    {
+                        if (chapter_track_parse(pos, trak_size) >= ERR_OK)
+                            return ERR_OK;
+                        /* malformed candidate: keep scanning */
+                    }
+                }
+            }
+        }
+        pos += trak_size;
+    }
+    return ERR_FAIL;
+}
+
 static int ftypin(int size)
 {
     enum {BUFSIZE = 40};
@@ -1157,6 +1690,125 @@ static creator_t g_meta2[] = {
     STOP()
 };
 
+/*
+ * Read the "chpl" atom given the absolute position/size of its parent
+ * "meta" atom. meta is a FullBox, so its payload starts after a 4-byte
+ * version/flags header.
+ */
+static int chpl_in_meta(long meta_pos, uint32_t meta_size)
+{
+    long payload = meta_pos + 8 + 4; /* box header + FullBox header */
+    long end = meta_pos + meta_size;
+    long cur = payload;
+
+    if (meta_size < 12)
+        return ERR_FAIL;
+
+    while (cur + 8 <= end)
+    {
+        uint32_t hdr, asize;
+        char nm[4];
+
+        if (fseek(g_fin, cur, SEEK_SET))
+            return ERR_FAIL;
+        if (atom_head(&hdr, &asize, nm) < ERR_OK)
+            return ERR_FAIL;
+        if (cur + asize > end)
+            return ERR_FAIL;
+        if (!memcmp(nm, "chpl", 4))
+            return chplin(asize - hdr);
+        cur += asize;
+    }
+    return ERR_FAIL;
+}
+
+/*
+ * Chapter entry point. First tries the Apple "chpl" atom under
+ * moov/udta/meta; if it is absent (or empty), falls back to the ISO
+ * chapter-reference text track. A file without chapters simply keeps an
+ * empty table; this is never an error.
+ */
+static void chapters_scan(void)
+{
+    long pos = 0;
+
+    /* Walk top-level atoms down to moov/udta/meta. */
+    for (;;)
+    {
+        uint32_t hdr, moov_size;
+        char nm[4];
+        long child;
+
+        if (fseek(g_fin, pos, SEEK_SET))
+            return;
+        if (atom_head(&hdr, &moov_size, nm) < ERR_OK)
+            return; /* EOF or malformed atom */
+        if (moov_size < hdr)
+            return;
+        if (memcmp(nm, "moov", 4) == 0)
+        {
+            long moov_payload = pos + hdr;
+            long moov_end = pos + moov_size;
+
+            child = moov_payload;
+            while (child + 8 <= moov_end)
+            {
+                uint32_t h2, udta_size;
+                char n2[4];
+
+                if (fseek(g_fin, child, SEEK_SET))
+                    return;
+                if (atom_head(&h2, &udta_size, n2) < ERR_OK)
+                    return;
+                if (child + udta_size > moov_end)
+                    return;
+                if (!memcmp(n2, "udta", 4))
+                {
+                    long u = child + h2;
+                    long u_end = child + udta_size;
+                    while (u + 8 <= u_end)
+                    {
+                        uint32_t h3, sub_size;
+                        char n3[4];
+
+                        if (fseek(g_fin, u, SEEK_SET))
+                            return;
+                        if (atom_head(&h3, &sub_size, n3) < ERR_OK)
+                            return;
+                        if (u + sub_size > u_end)
+                            return;
+                        /*
+                         * Two legal placements exist in the wild:
+                         *  - udta/chpl directly (Apple QuickTime, FFmpeg);
+                         *  - udta/meta/chpl (some other muxers).
+                         */
+                        if (!memcmp(n3, "chpl", 4))
+                        {
+                            if (chplin(sub_size - h3) >= ERR_OK
+                                && mp4config.chapters.count > 0)
+                                return;
+                        }
+                        else if (!memcmp(n3, "meta", 4))
+                        {
+                            if (chpl_in_meta(u, sub_size) >= ERR_OK
+                                && mp4config.chapters.count > 0)
+                                return;
+                        }
+                        u += sub_size;
+                    }
+                }
+                child += udta_size;
+            }
+
+            /* No usable chpl: try the chapter-reference text track. */
+            chapters_from_tracks(moov_payload, moov_size - hdr);
+            return;
+        }
+        pos += moov_size;
+    }
+}
+
+
 
 int mp4read_frame(void)
 {
@@ -1214,11 +1866,24 @@ static void mp4info(void)
 
 int mp4read_close(void)
 {
+    chapters_clear();
     freeMem(&mp4config.frame.info);
     freeMem(&mp4config.frame.map);
     freeMem(&mp4config.bitbuf.data);
 
     return ERR_OK;
+}
+
+uint32_t mp4read_chapter_count(void)
+{
+    return mp4config.chapters.count;
+}
+
+const mp4chapter_t *mp4read_chapter_get(uint32_t idx)
+{
+    if (idx >= mp4config.chapters.count)
+        return NULL;
+    return &mp4config.chapters.items[idx];
 }
 
 int mp4read_open(char *name)
@@ -1287,6 +1952,9 @@ int mp4read_open(char *name)
         atomsize = INT_MAX;
         ret = parse(&atomsize);
     }
+
+    /* Chapters are optional; a missing table is not an error. */
+    chapters_scan();
 
     return ERR_OK;
 err:

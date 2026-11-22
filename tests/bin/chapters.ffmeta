@@ -1,0 +1,17 @@
+; FFmpeg metadata file for chapters.mp4
+; times are in milliseconds, titles are UTF-8
+[CHAPTER]
+TIMEBASE=1/1000
+START=0
+END=500
+title=Intro / 序章
+[CHAPTER]
+TIMEBASE=1/1000
+START=500
+END=1500
+title=Main
+[CHAPTER]
+TIMEBASE=1/1000
+START=1500
+END=3000
+title=Outro / 終わり

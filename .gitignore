@@ -1,2 +1,4 @@
 bazel-*
 build/
+build-clean/
+build-asan/

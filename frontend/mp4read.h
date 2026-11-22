@@ -31,6 +31,24 @@ typedef struct
     uint32_t samplesperchunk;
 } slice_info_t;
 
+/*
+ * One MP4 chapter.
+ *
+ * start_ns is the chapter start offset from the beginning of the movie,
+ * in nanoseconds. The title is a NUL-terminated UTF-8 string owned by the
+ * mp4 reader; it stays valid until mp4read_close().
+ *
+ * Both chapter representations found in MP4 files are supported:
+ *  - Apple QuickTime "chpl" atom (udta/meta/chpl);
+ *  - ISO/IEC 14496-12 chapter reference: a text track referenced by a
+ *    "chap" track reference, with timed plain-text samples.
+ */
+typedef struct
+{
+    uint64_t start_ns;
+    char *title;
+} mp4chapter_t;
+
 typedef struct
 {
     uint32_t ctime, mtime;
@@ -84,6 +102,12 @@ typedef struct
         int header;
         int tags;
     } verbose;
+
+    // chapter table; NULL when the file contains no chapters
+    struct {
+        mp4chapter_t *items;
+        uint32_t count;
+    } chapters;
 } mp4config_t;
 
 extern mp4config_t mp4config;
@@ -92,3 +116,11 @@ int mp4read_open(char *name);
 int mp4read_seek(uint32_t framenum);
 int mp4read_frame(void);
 int mp4read_close(void);
+
+/* Number of chapters found in the opened file (0 if none). */
+uint32_t mp4read_chapter_count(void);
+/*
+ * Returns chapter number idx (0-based). The returned pointer is owned by the
+ * reader and remains valid until mp4read_close(). NULL if idx is out of range.
+ */
+const mp4chapter_t *mp4read_chapter_get(uint32_t idx);
