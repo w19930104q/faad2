@@ -35,8 +35,12 @@
 extern "C" {
 #endif
 
-#define NUM_ERROR_MESSAGES 35
+#define NUM_ERROR_MESSAGES 37
 extern char *err_msg[];
+
+/* LATM related error codes (index into err_msg) */
+#define ERR_LATM_PARSE       35
+#define ERR_LATM_NOT_INIT    36
 
 #ifdef __cplusplus
 }

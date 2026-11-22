@@ -372,6 +372,12 @@ typedef struct
 
 	latm_header latm_config;
 
+    /* LATM/LOAS stream buffer for the NeAACDecLatmFeed()/
+       NeAACDecLatmDecode() streaming interface */
+    uint8_t *latm_stream_buffer;
+    uint32_t latm_stream_fill;
+    uint32_t latm_stream_capacity;
+
     /* output data buffer */
     void *sample_buffer;
 

@@ -237,16 +237,17 @@ unsigned char NeAACDecSetConfiguration(NeAACDecHandle hpDecoder,
 }
 
 
-#if 0
 static int latmCheck(latm_header *latm, bitfile *ld)
 {
-    uint32_t good=0, bad=0, bits, m;
+    uint32_t good=0, bits, m;
 
-    while (ld->bytes_left)
+    while (faad_get_processed_bits(ld) + 8 <= ld->buffer_size * 8)
     {
         bits = faad_latm_frame(latm, ld);
         if(bits==0xFFFFFFFF)
-            bad++;
+            break; /* malformed frame */
+        else if(bits==0)
+            break; /* no more complete frames in the buffer */
         else
         {
             good++;
@@ -261,7 +262,6 @@ static int latmCheck(latm_header *latm, bitfile *ld)
 
     return (good>0);
 }
-#endif
 
 long NeAACDecInit(NeAACDecHandle hpDecoder,
                               unsigned char *buffer,
@@ -287,19 +287,21 @@ long NeAACDecInit(NeAACDecHandle hpDecoder,
 
     if (buffer != NULL)
     {
-#if 0
-        int is_latm;
+        int is_latm = 0;
         latm_header *l = &hDecoder->latm_config;
-#endif
 
         faad_initbits(&ld, buffer, buffer_size);
 
-#if 0
-        memset(l, 0, sizeof(latm_header));
-        is_latm = latmCheck(l, &ld);
-        l->inited = 0;
-        l->frameLength = 0;
-        faad_rewindbits(&ld);
+        /* only probe for LATM when the buffer starts with the LOAS
+           sync word, so ADTS/ADIF/RAW streams are never misdetected */
+        if ((buffer_size >= 3) && (buffer[0] == 0x56) && ((buffer[1] & 0xE0) == 0xE0))
+        {
+            memset(l, 0, sizeof(latm_header));
+            is_latm = latmCheck(l, &ld);
+            l->inited = 0;
+            l->frameLength = 0;
+            faad_rewindbits(&ld);
+        }
         if(is_latm && l->ASCbits>0)
         {
             int32_t x;
@@ -307,9 +309,9 @@ long NeAACDecInit(NeAACDecHandle hpDecoder,
             x = NeAACDecInit2(hDecoder, l->ASC, (l->ASCbits+7)/8, samplerate, channels);
             if(x!=0)
                 hDecoder->latm_header_present = 0;
+            faad_endbits(&ld);
             return x;
         } else
-#endif
         /* Check if an ADIF header is present */
         if ((buffer_size >= 8) && (buffer[0] == 'A') && (buffer[1] == 'D') &&
             (buffer[2] == 'I') && (buffer[3] == 'F'))
@@ -474,6 +476,179 @@ char NeAACDecInit2(NeAACDecHandle hpDecoder,
     return 0;
 }
 
+/* Initial and maximum size of the LATM streaming buffer */
+#define LATM_STREAM_BUFFER_SIZE (4 * (3 + 0x1FFF)) /* holds several max size LOAS frames */
+#define LATM_STREAM_BUFFER_MAX  (1 << 20)
+
+/* Init the library for direct LATM/LOAS stream decoding.
+   Supports AudioMuxVersion 0 and 1. The buffer must contain the beginning
+   of a LATM/LOAS stream with at least one complete AudioMuxElement carrying
+   a StreamMuxConfig. Returns 0 on success, < 0 on error. */
+long NeAACDecInitLATM(NeAACDecHandle hpDecoder,
+                      unsigned char *buffer,
+                      unsigned long buffer_size,
+                      unsigned long *samplerate,
+                      unsigned char *channels)
+{
+    bitfile ld;
+    latm_header *l;
+    NeAACDecStruct* hDecoder = (NeAACDecStruct*)hpDecoder;
+    uint32_t ret;
+    int32_t x;
+
+    if ((hDecoder == NULL) || (buffer == NULL) || (buffer_size == 0)
+        || (samplerate == NULL) || (channels == NULL))
+        return -1;
+
+    l = &hDecoder->latm_config;
+    memset(l, 0, sizeof(latm_header));
+
+    faad_initbits(&ld, buffer, buffer_size);
+    if (ld.error)
+        return -1;
+
+    /* parse one AudioMuxElement to read the StreamMuxConfig */
+    ret = faad_latm_frame(l, &ld);
+    faad_endbits(&ld);
+    if ((ret == 0) || (ret == 0xFFFFFFFF))
+        return -1; /* malformed stream or not enough data */
+
+    if (l->ASCbits == 0)
+        return -1; /* no StreamMuxConfig found */
+
+    hDecoder->latm_header_present = 1;
+    x = NeAACDecInit2(hDecoder, l->ASC, (l->ASCbits+7)/8, samplerate, channels);
+    if (x != 0)
+    {
+        hDecoder->latm_header_present = 0;
+        return -1;
+    }
+
+    /* reset the streaming buffer, the stream is fed from its first byte */
+    hDecoder->latm_stream_fill = 0;
+
+    return 0;
+}
+
+/* Feed a chunk of a LATM/LOAS stream into the decoder. The chunk may have
+   any size. Returns 0 on success, < 0 on error. */
+long NeAACDecLatmFeed(NeAACDecHandle hpDecoder,
+                      const unsigned char *data,
+                      unsigned long size)
+{
+    NeAACDecStruct* hDecoder = (NeAACDecStruct*)hpDecoder;
+    uint32_t needed;
+
+    if ((hDecoder == NULL) || ((data == NULL) && (size > 0)))
+        return -1;
+    if (!hDecoder->latm_header_present)
+        return -1; /* decoder not initialised for LATM */
+    if (size == 0)
+        return 0;
+    if (size > LATM_STREAM_BUFFER_MAX)
+        return -2; /* single chunk larger than the stream buffer limit */
+
+    needed = hDecoder->latm_stream_fill + (uint32_t)size;
+    if (needed > hDecoder->latm_stream_capacity)
+    {
+        uint32_t cap = hDecoder->latm_stream_capacity;
+        uint8_t *nb;
+
+        if (cap < LATM_STREAM_BUFFER_SIZE)
+            cap = LATM_STREAM_BUFFER_SIZE;
+        while (cap < needed)
+        {
+            if (cap >= LATM_STREAM_BUFFER_MAX)
+                return -2; /* stream buffer overflow, frames not consumed */
+            cap *= 2;
+            if (cap > LATM_STREAM_BUFFER_MAX)
+                cap = LATM_STREAM_BUFFER_MAX;
+        }
+
+        nb = (uint8_t*)faad_malloc(cap);
+        if (nb == NULL)
+            return -2;
+        if (hDecoder->latm_stream_buffer != NULL)
+        {
+            memcpy(nb, hDecoder->latm_stream_buffer, hDecoder->latm_stream_fill);
+            faad_free(hDecoder->latm_stream_buffer);
+        }
+        hDecoder->latm_stream_buffer = nb;
+        hDecoder->latm_stream_capacity = cap;
+    }
+
+    memcpy(hDecoder->latm_stream_buffer + hDecoder->latm_stream_fill, data, size);
+    hDecoder->latm_stream_fill += size;
+
+    return 0;
+}
+
+/* Decode the next LATM/LOAS frame from the internally buffered stream.
+   Returns the decoded samples, or NULL when more input data is needed
+   (hInfo->error == 0) or when an error occurred (hInfo->error != 0). */
+void* NeAACDecLatmDecode(NeAACDecHandle hpDecoder,
+                         NeAACDecFrameInfo *hInfo)
+{
+    NeAACDecStruct* hDecoder = (NeAACDecStruct*)hpDecoder;
+    uint32_t i, frame_size, payload_len;
+    void *sample_buffer;
+
+    if ((hDecoder == NULL) || (hInfo == NULL))
+        return NULL;
+
+    memset(hInfo, 0, sizeof(NeAACDecFrameInfo));
+
+    if (!hDecoder->latm_header_present)
+    {
+        hInfo->error = ERR_LATM_NOT_INIT;
+        return NULL;
+    }
+
+    /* find the LOAS sync word (11 bits, 0x2B7) */
+    for (i = 0; i + 1 < hDecoder->latm_stream_fill; i++)
+    {
+        if ((hDecoder->latm_stream_buffer[i] == 0x56) &&
+            ((hDecoder->latm_stream_buffer[i+1] & 0xE0) == 0xE0))
+            break;
+    }
+    /* drop garbage before the sync word; keep the last byte, it may be
+       the first byte of a sync word split across two chunks */
+    if (i > 0)
+    {
+        hDecoder->latm_stream_fill -= i;
+        memmove(hDecoder->latm_stream_buffer, hDecoder->latm_stream_buffer + i,
+                hDecoder->latm_stream_fill);
+    }
+    if (hDecoder->latm_stream_fill < 3)
+        return NULL; /* need more data */
+
+    payload_len = ((uint32_t)(hDecoder->latm_stream_buffer[1] & 0x1F) << 8)
+        | hDecoder->latm_stream_buffer[2];
+    if (payload_len == 0)
+    {
+        /* stuffing, drop this header and look for the next sync */
+        hDecoder->latm_stream_fill -= 3;
+        memmove(hDecoder->latm_stream_buffer, hDecoder->latm_stream_buffer + 3,
+                hDecoder->latm_stream_fill);
+        return NULL;
+    }
+
+    frame_size = 3 + payload_len;
+    if (hDecoder->latm_stream_fill < frame_size)
+        return NULL; /* need more data */
+
+    sample_buffer = aac_frame_decode(hDecoder, hInfo,
+        hDecoder->latm_stream_buffer, frame_size, NULL, 0);
+
+    /* advance to the next frame, also on error: the LOAS length field
+       keeps the stream framed */
+    hDecoder->latm_stream_fill -= frame_size;
+    memmove(hDecoder->latm_stream_buffer, hDecoder->latm_stream_buffer + frame_size,
+            hDecoder->latm_stream_fill);
+
+    return sample_buffer;
+}
+
 #ifdef DRM
 char NeAACDecInitDRM(NeAACDecHandle *hpDecoder,
                                  unsigned long samplerate,
@@ -560,6 +735,8 @@ void NeAACDecClose(NeAACDecHandle hpDecoder)
     drc_end(hDecoder->drc);
 
     if (hDecoder->sample_buffer) faad_free(hDecoder->sample_buffer);
+
+    if (hDecoder->latm_stream_buffer) faad_free(hDecoder->latm_stream_buffer);
 
 #ifdef SBR_DEC
     for (i = 0; i < MAX_SYNTAX_ELEMENTS; i++)
@@ -855,9 +1032,7 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
     uint32_t bitsconsumed;
     uint16_t frame_len;
     void *sample_buffer;
-#if 0
     uint32_t startbit=0, endbit=0, payload_bits=0;
-#endif
     uint32_t required_buffer_size=0;
 
 #ifdef PROFILE
@@ -930,18 +1105,22 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
     }
 #endif
 
-#if 0
     if(hDecoder->latm_header_present)
     {
         payload_bits = faad_latm_frame(&hDecoder->latm_config, &ld);
         startbit = faad_get_processed_bits(&ld);
-        if(payload_bits == -1U)
+        if(payload_bits == 0xFFFFFFFF)
         {
-            hInfo->error = 1;
+            hInfo->error = ERR_LATM_PARSE;
             goto error;
         }
+        if(payload_bits == 0)
+        {
+            /* no complete LATM frame in the buffer: no output, no error */
+            faad_endbits(&ld);
+            return NULL;
+        }
     }
-#endif
 
 #ifdef DRM
     if (hDecoder->object_type == DRM_ER_LC)
@@ -988,18 +1167,21 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
     }
 #endif
 
-#if 0
     if(hDecoder->latm_header_present)
     {
         endbit = faad_get_processed_bits(&ld);
         if(endbit-startbit > payload_bits)
-            fprintf(stderr, "\r\nERROR, too many payload bits read: %u > %d. Please. report with a link to a sample\n",
-                endbit-startbit, payload_bits);
-        if(hDecoder->latm_config.otherDataLenBits > 0)
-            faad_getbits(&ld, hDecoder->latm_config.otherDataLenBits);
+        {
+            /* the decoder read past the LATM payload: broken stream */
+            hInfo->error = ERR_LATM_PARSE;
+            goto error;
+        }
+        /* skip the rest of the LATM payload (AAC padding, other data,
+           mux alignment) so that exactly one LOAS frame is consumed */
+        if(payload_bits > endbit-startbit)
+            faad_getbits(&ld, payload_bits - (endbit-startbit));
         faad_byte_align(&ld);
     }
-#endif
 
     channels = hDecoder->fr_channels;
 
@@ -1026,9 +1208,7 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
 
 
     if (!hDecoder->adts_header_present && !hDecoder->adif_header_present
-#if 0
         && !hDecoder->latm_header_present
-#endif
         )
     {
         if (hDecoder->channelConfiguration == 0)
@@ -1080,10 +1260,8 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
         hInfo->header_type = ADIF;
     if (hDecoder->adts_header_present)
         hInfo->header_type = ADTS;
-#if 0
     if (hDecoder->latm_header_present)
         hInfo->header_type = LATM;
-#endif
 #if (defined(PS_DEC) || defined(DRM_PS))
     hInfo->ps = hDecoder->ps_used_global;
 #endif

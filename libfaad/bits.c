@@ -143,7 +143,6 @@ void faad_flushbits_ex(bitfile *ld, uint32_t bits)
 //        ld->error = 1;
 }
 
-#ifdef DRM
 /* rewind to beginning */
 void faad_rewindbits(bitfile *ld)
 {
@@ -174,7 +173,6 @@ void faad_rewindbits(bitfile *ld)
     ld->bits_left = 32;
     ld->tail = &ld->start[2];
 }
-#endif
 
 /* reset to a certain point */
 void faad_resetbits(bitfile *ld, uint32_t bits)

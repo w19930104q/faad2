@@ -2544,7 +2544,6 @@ static void adts_error_check(adts_header *adts, bitfile *ld)
 }
 
 /* LATM parsing functions */
-#if 0
 
 static uint32_t latm_get_value(bitfile *ld)
 {
@@ -2582,6 +2581,10 @@ static uint32_t latmParsePayload(latm_header *latm, bitfile *ld)
     return framelen;
 }
 
+/* Parse one AudioMuxElement (ISO/IEC 14496-3, AudioMuxVersion 0 and 1).
+ * Returns the payload length (>0) on success, 0 on a malformed or
+ * unsupported element. Reading past the end of the buffer is reported by
+ * the caller through faad_get_processed_bits(). */
 static uint32_t latmAudioMuxElement(latm_header *latm, bitfile *ld)
 {
     uint32_t ascLen, asc_bits=0;
@@ -2592,14 +2595,14 @@ static uint32_t latmAudioMuxElement(latm_header *latm, bitfile *ld)
     latm->useSameStreamMux = (uint8_t)faad_getbits(ld, 1);
     if(!latm->useSameStreamMux)
     {
-        //parseSameStreamMuxConfig
+        //parse StreamMuxConfig
         latm->version = (uint8_t) faad_getbits(ld, 1);
+        latm->versionA = 0;
         if(latm->version)
             latm->versionA = (uint8_t) faad_getbits(ld, 1);
         if(latm->versionA)
         {
             //dunno the payload format for versionA
-            fprintf(stderr, "versionA not supported\n");
             return 0;
         }
         if(latm->version) //read taraBufferFullness
@@ -2610,8 +2613,7 @@ static uint32_t latmAudioMuxElement(latm_header *latm, bitfile *ld)
         latm->numLayers = faad_getbits(ld, 3) + 1;
         if(latm->numPrograms>1 || !latm->allStreamsSameTimeFraming || latm->numSubFrames>1 || latm->numLayers>1)
         {
-            fprintf(stderr, "\r\nUnsupported LATM configuration: %d programs/ %d subframes, %d layers, allstreams: %d\n",
-                latm->numPrograms, latm->numSubFrames, latm->numLayers, latm->allStreamsSameTimeFraming);
+            /* unsupported LATM configuration */
             return 0;
         }
         ascLen = 0;
@@ -2625,25 +2627,25 @@ static uint32_t latmAudioMuxElement(latm_header *latm, bitfile *ld)
         //horrid hack to unread the ASC bits and store them in latm->ASC
         //the correct code would rely on an ideal faad_ungetbits()
         y1 = faad_get_processed_bits(ld);
-        if((y1-x1) <= MAX_ASC_BYTES*8)
-        {
-            faad_rewindbits(ld);
-            m = x1;
-            while(m>0)
-            {
-                n = min(m, 32);
-                faad_getbits(ld, n);
-                m -= n;
-            }
+        if((y1-x1) > MAX_ASC_BYTES*8)
+            return 0; /* AudioSpecificConfig too large */
 
-            i = 0;
-            m = latm->ASCbits = y1 - x1;
-            while(m > 0)
-            {
-                n = min(m, 8);
-                latm->ASC[i++] = (uint8_t) faad_getbits(ld, n);
-                m -= n;
-            }
+        faad_rewindbits(ld);
+        m = x1;
+        while(m>0)
+        {
+            n = min(m, 32);
+            faad_getbits(ld, n);
+            m -= n;
+        }
+
+        i = 0;
+        m = latm->ASCbits = y1 - x1;
+        while(m > 0)
+        {
+            n = min(m, 8);
+            latm->ASC[i++] = (uint8_t) faad_getbits(ld, n);
+            m -= n;
         }
 
         asc_bits = y1-x1;
@@ -2661,15 +2663,11 @@ static uint32_t latmAudioMuxElement(latm_header *latm, bitfile *ld)
         {
             latm->frameLength = faad_getbits(ld, 9);
             if(latm->frameLength==0)
-            {
-                fprintf(stderr, "Invalid frameLength: 0\r\n");
-                return 0;
-            }
+                return 0; /* invalid frameLength */
             latm->frameLength = (latm->frameLength+20)*8;
         }
         else
         {   //hellish CELP or HCVX stuff, discard
-            fprintf(stderr, "Unsupported CELP/HCVX framelentype: %d\n", latm->framelen_type);
             return 0;
         }
 
@@ -2698,31 +2696,55 @@ static uint32_t latmAudioMuxElement(latm_header *latm, bitfile *ld)
           return 0;
 }
 
+/* Locate and parse the next LOAS/LATM frame in the buffer.
+ * Returns:
+ *   >0         : number of payload bits left in this LOAS frame; the bit
+ *                reader is positioned at the start of the AAC payload
+ *   0          : no complete frame available, more input data is needed
+ *   0xFFFFFFFF : malformed LATM/LOAS stream
+ */
 uint32_t faad_latm_frame(latm_header *latm, bitfile *ld)
 {
-    uint16_t len;
-    uint32_t initpos, endpos, firstpos, ret;
+    uint32_t len;
+    uint32_t initpos, endpos, ret;
 
-    firstpos = faad_get_processed_bits(ld);
-    while (ld->bytes_left)
+    for (;;)
     {
+        uint32_t pos = faad_get_processed_bits(ld);
+
+        /* need at least the 11 bit sync + 13 bit length */
+        if (pos + 24 > ld->buffer_size * 8)
+            return 0; /* not enough data */
+
         faad_byte_align(ld);
+        pos = faad_get_processed_bits(ld);
+        if (pos + 24 > ld->buffer_size * 8)
+            return 0; /* not enough data */
+
         if(faad_showbits(ld, 11) != 0x2B7)
         {
-            faad_getbits(ld, 8);
+            faad_getbits(ld, 8); /* skip garbage byte, look for sync */
             continue;
         }
         faad_getbits(ld, 11);
         len = faad_getbits(ld, 13);
         if(!len)
-            continue;
+            continue; /* stuffing, skip */
+        /* only parse the element once the complete LOAS frame,
+           payload included, is present in the buffer */
+        if (faad_get_processed_bits(ld) + len * 8 > ld->buffer_size * 8)
+            return 0; /* truncated frame, more data needed */
         initpos = faad_get_processed_bits(ld);
         ret = latmAudioMuxElement(latm, ld);
         endpos = faad_get_processed_bits(ld);
-        if(ret>0)
+        if(endpos > ld->buffer_size * 8)
+            return 0; /* truncated frame, more data needed */
+        if(ret > 0)
+        {
+            if(endpos - initpos >= len * 8)
+                return 0xFFFFFFFF; /* no room left for the payload */
             return (len*8)-(endpos-initpos);
-        //faad_getbits(ld, initpos-endpos); //go back to initpos, but is valid a getbits(-N) ?
+        }
+        return 0xFFFFFFFF; /* malformed AudioMuxElement */
     }
-    return 0xFFFFFFFF;
 }
-#endif

@@ -172,6 +172,7 @@ static void lookforheader(aac_buffer *b)
         if (b->bytes_into_buffer > 4)
         {
             if( ((b->buffer[0+i] == 0xff) && ((b->buffer[1+i] & 0xf6) == 0xf0)) ||
+                ((b->buffer[0+i] == 0x56) && ((b->buffer[1+i] & 0xe0) == 0xe0)) ||
                 (b->buffer[0+i] == 'A'    && b->buffer[1+i] == 'D' && b->buffer[2+i] == 'I' && b->buffer[3+i] == 'F'))
             {
                 fill_buffer(b);
@@ -620,6 +621,11 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
 
         header_type = 2;
     }
+    else if ((b.buffer[0] == 0x56) && ((b.buffer[1] & 0xE0) == 0xE0))
+    {
+        /* LOAS sync word: LATM stream */
+        header_type = 3;
+    }
 
     *song_length = length;
 
@@ -653,6 +659,9 @@ static int decodeAACfile(char *aacfile, char *sndfile, char *adts_fn, int to_std
     case 2:
         faad_fprintf(stderr, "ADIF, %.3f sec, %d kbps, %d Hz\n\n",
             length, bitrate, samplerate);
+        break;
+    case 3:
+        faad_fprintf(stderr, "LATM, %d Hz\n\n", samplerate);
         break;
     }
 

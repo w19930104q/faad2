@@ -81,9 +81,7 @@ void faad_initbits_rev(bitfile *ld, void *buffer,
 uint8_t faad_byte_align(bitfile *ld);
 uint32_t faad_get_processed_bits(bitfile *ld);
 void faad_flushbits_ex(bitfile *ld, uint32_t bits);
-#ifdef DRM
 void faad_rewindbits(bitfile *ld);
-#endif
 void faad_resetbits(bitfile *ld, uint32_t bits);
 uint8_t *faad_getbitbuffer(bitfile *ld, uint32_t bits
                        DEBUGDEC);

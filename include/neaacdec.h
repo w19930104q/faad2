@@ -49,6 +49,9 @@ extern "C" {
 #define faacDecGetCurrentConfiguration NeAACDecGetCurrentConfiguration
 #define faacDecInit                    NeAACDecInit
 #define faacDecInit2                   NeAACDecInit2
+#define faacDecInitLATM                NeAACDecInitLATM
+#define faacDecLatmFeed                NeAACDecLatmFeed
+#define faacDecLatmDecode              NeAACDecLatmDecode
 #define faacDecInitDRM                 NeAACDecInitDRM
 #define faacDecPostSeekReset           NeAACDecPostSeekReset
 #define faacDecOpen                    NeAACDecOpen
@@ -223,6 +226,33 @@ NEAACDECAPI char NeAACDecInit2(NeAACDecHandle hDecoder,
                                unsigned long SizeOfDecoderSpecificInfo,
                                unsigned long *samplerate,
                                unsigned char *channels);
+
+/* Init the library for direct LATM/LOAS stream decoding.
+   Both AudioMuxVersion 0 and 1 are supported. buffer must point to the
+   beginning of a LATM/LOAS stream containing at least one complete
+   AudioMuxElement carrying a StreamMuxConfig; the buffer is only probed,
+   none of its bytes are consumed. Returns 0 on success, < 0 on error. */
+NEAACDECAPI long NeAACDecInitLATM(NeAACDecHandle hDecoder,
+                                  unsigned char *buffer,
+                                  unsigned long buffer_size,
+                                  unsigned long *samplerate,
+                                  unsigned char *channels);
+
+/* Feed a chunk of a LATM/LOAS stream into the decoder. The chunk may have
+   any size; the data is buffered internally until a complete frame is
+   available. The stream must be fed from its first byte. The decoder must
+   have been initialised with NeAACDecInitLATM (or NeAACDecInit on a LATM
+   stream) first. Returns 0 on success, < 0 on error. */
+NEAACDECAPI long NeAACDecLatmFeed(NeAACDecHandle hDecoder,
+                                  const unsigned char *data,
+                                  unsigned long size);
+
+/* Decode the next LATM/LOAS frame from the data buffered by
+   NeAACDecLatmFeed. Returns the decoded samples, or NULL when more input
+   data is needed (hInfo->error == 0) or when an error occurred
+   (hInfo->error != 0, see NeAACDecGetErrorMessage). */
+NEAACDECAPI void* NeAACDecLatmDecode(NeAACDecHandle hDecoder,
+                                     NeAACDecFrameInfo *hInfo);
 
 /* Init the library for DRM */
 NEAACDECAPI char NeAACDecInitDRM(NeAACDecHandle *hDecoder, unsigned long samplerate,
