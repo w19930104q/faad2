@@ -1052,7 +1052,7 @@ uint8_t reconstruct_single_channel(NeAACDecStruct *hDecoder, ic_stream *ics,
 
     /* drc decoding */
 #ifdef APPLY_DRC
-    if (hDecoder->drc->present)
+    if (hDecoder->drc->present && (hDecoder->drc->level != FAAD_DRC_OFF))
     {
         if (!hDecoder->drc->exclude_mask[sce->channel] || !hDecoder->drc->excluded_chns_present)
             drc_decode(hDecoder->drc, spec_coef);
@@ -1309,7 +1309,7 @@ uint8_t reconstruct_channel_pair(NeAACDecStruct *hDecoder, ic_stream *ics1, ic_s
 
     /* drc decoding */
 #if APPLY_DRC
-    if (hDecoder->drc->present)
+    if (hDecoder->drc->present && (hDecoder->drc->level != FAAD_DRC_OFF))
     {
         if (!hDecoder->drc->exclude_mask[cpe->channel] || !hDecoder->drc->excluded_chns_present)
             drc_decode(hDecoder->drc, spec_coef1);

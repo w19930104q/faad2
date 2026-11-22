@@ -37,6 +37,7 @@
 
 drc_info *drc_init(real_t cut, real_t boost)
 {
+    uint8_t i;
     drc_info *drc = (drc_info*)faad_malloc(sizeof(drc_info));
     memset(drc, 0, sizeof(drc_info));
 
@@ -47,6 +48,11 @@ drc_info *drc_init(real_t cut, real_t boost)
     drc->band_top[0] = 1024/4 - 1;
     drc->dyn_rng_sgn[0] = 1;
     drc->dyn_rng_ctl[0] = 0;
+
+    /* default: full compression, the historical library behaviour */
+    drc->level = FAAD_DRC_HEAVY;
+    for (i = 0; i < 17; i++)
+        drc->band_gain[i] = 1.0;
 
     return drc;
 }
@@ -112,15 +118,28 @@ static real_t drc_pow2_table[] =
 void drc_decode(drc_info *drc, real_t *spec)
 {
     uint16_t i, bd, top;
-#ifdef FIXED_POINT
-    int32_t exp, frac;
-#else
+#ifndef FIXED_POINT
+    real_t ctrl1 = drc->ctrl1;
+    real_t ctrl2 = drc->ctrl2;
     real_t factor, exp;
+#else
+    int32_t exp, frac;
+    int32_t ctl;
+    double gain;
 #endif
     uint16_t bottom = 0;
 
     if (drc->num_bands == 1)
         drc->band_top[0] = 1024/4 - 1;
+
+#ifndef FIXED_POINT
+    /* FAAD_DRC_LIGHT applies half of the compression/boost amount */
+    if (drc->level == FAAD_DRC_LIGHT)
+    {
+        ctrl1 *= REAL_CONST(0.5);
+        ctrl2 *= REAL_CONST(0.5);
+    }
+#endif
 
     for (bd = 0; bd < drc->num_bands; bd++)
     {
@@ -129,24 +148,43 @@ void drc_decode(drc_info *drc, real_t *spec)
 #ifndef FIXED_POINT
         /* Decode DRC gain factor */
         if (drc->dyn_rng_sgn[bd])  /* compress */
-            exp = ((-drc->ctrl1 * drc->dyn_rng_ctl[bd]) - (DRC_REF_LEVEL - drc->prog_ref_level))/REAL_CONST(24.0);
+            exp = ((-ctrl1 * drc->dyn_rng_ctl[bd]) - (DRC_REF_LEVEL - drc->prog_ref_level))/REAL_CONST(24.0);
         else /* boost */
-            exp = ((drc->ctrl2 * drc->dyn_rng_ctl[bd]) - (DRC_REF_LEVEL - drc->prog_ref_level))/REAL_CONST(24.0);
+            exp = ((ctrl2 * drc->dyn_rng_ctl[bd]) - (DRC_REF_LEVEL - drc->prog_ref_level))/REAL_CONST(24.0);
         factor = (real_t)pow(2.0, exp);
+
+        /* Record the applied gain for NeAACDecGetDRCFrameInfo() */
+        drc->band_gain[bd] = (double)factor;
 
         /* Apply gain factor */
         for (i = bottom; i < top; i++)
             spec[i] *= factor;
 #else
+        ctl = drc->dyn_rng_ctl[bd];
+
+        /* FAAD_DRC_LIGHT applies half of the compression/boost amount;
+           the halved control value is rounded */
+        if (drc->level == FAAD_DRC_LIGHT)
+            ctl = (ctl + 1) >> 1;
+
         /* Decode DRC gain factor */
         if (drc->dyn_rng_sgn[bd])  /* compress */
         {
-            exp = -1 * (drc->dyn_rng_ctl[bd] - (DRC_REF_LEVEL - drc->prog_ref_level))/ 24;
-            frac = -1 * (drc->dyn_rng_ctl[bd] - (DRC_REF_LEVEL - drc->prog_ref_level)) % 24;
+            exp = (-ctl - (DRC_REF_LEVEL - drc->prog_ref_level))/ 24;
+            frac = (-ctl - (DRC_REF_LEVEL - drc->prog_ref_level)) % 24;
         } else { /* boost */
-            exp = (drc->dyn_rng_ctl[bd] - (DRC_REF_LEVEL - drc->prog_ref_level))/ 24;
-            frac = (drc->dyn_rng_ctl[bd] - (DRC_REF_LEVEL - drc->prog_ref_level)) % 24;
+            exp = (ctl - (DRC_REF_LEVEL - drc->prog_ref_level))/ 24;
+            frac = (ctl - (DRC_REF_LEVEL - drc->prog_ref_level)) % 24;
         }
+
+        /* Record the applied gain for NeAACDecGetDRCFrameInfo() */
+        gain = (double)drc_pow2_table[frac+23] / (double)COEF_PRECISION;
+        {
+            int32_t e = exp;
+            while (e > 0) { gain *= 2.0; e--; }
+            while (e < 0) { gain *= 0.5; e++; }
+        }
+        drc->band_gain[bd] = gain;
 
         /* Apply gain factor */
         if (exp < 0)

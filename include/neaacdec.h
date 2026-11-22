@@ -134,6 +134,46 @@ extern "C" {
    so at least so much bytes per channel should be available in this stream */
 #define FAAD_MIN_STREAMSIZE 768 /* 6144 bits/channel */
 
+/* DRC (dynamic range control) compression levels for NeAACDecSetDRCLevel().
+ *
+ * FAAD_DRC_OFF:   DRC is not applied at all. The output is bit-exact
+ *                 identical to a decode in which every DRC gain is zero
+ *                 (unity gain), i.e. no compression and no program
+ *                 reference level normalisation.
+ * FAAD_DRC_LIGHT: half compression. The dyn_rng_ctl compression/boost
+ *                 term is scaled by 1/2; the program reference level
+ *                 normalisation term is applied in full.
+ * FAAD_DRC_HEAVY: full compression (default). This is the historical
+ *                 behaviour of the library.
+ *
+ * The per-band gain factor that a level applies to the spectral data is
+ *   compress (dyn_rng_sgn == 1):
+ *     gain = 2 ^ ((-ctrl * dyn_rng_ctl - (DRC_REF_LEVEL - prog_ref_level)) / 24)
+ *   boost (dyn_rng_sgn == 0):
+ *     gain = 2 ^ (( ctrl * dyn_rng_ctl - (DRC_REF_LEVEL - prog_ref_level)) / 24)
+ * with ctrl = 1.0 for FAAD_DRC_HEAVY, ctrl = 0.5 for FAAD_DRC_LIGHT and
+ * DRC_REF_LEVEL = 80 (i.e. -20 dB in 0.25 dB steps). For FAAD_DRC_OFF the
+ * gain is exactly 1.0 for every band.
+ */
+#define FAAD_DRC_OFF   0
+#define FAAD_DRC_LIGHT 1
+#define FAAD_DRC_HEAVY 2
+
+/* Per-frame DRC information, see NeAACDecGetDRCFrameInfo() */
+typedef struct NeAACDecDRCFrameInfo
+{
+    /* DRC metadata was signalled in the bitstream */
+    unsigned char present;
+    /* compression level that is in effect (FAAD_DRC_*) */
+    unsigned char level;
+    /* number of DRC bands signalled in the bitstream (0 when !present) */
+    unsigned char num_bands;
+    /* linear gain factor effectively applied per band during the last
+       decoded frame; 1.0 for bands/channels to which no gain was applied
+       (e.g. level == FAAD_DRC_OFF or excluded channels) */
+    double gain[17];
+} NeAACDecDRCFrameInfo;
+
 
 typedef void *NeAACDecHandle;
 
@@ -209,6 +249,23 @@ NEAACDECAPI NeAACDecConfigurationPtr NeAACDecGetCurrentConfiguration(NeAACDecHan
 
 NEAACDECAPI unsigned char NeAACDecSetConfiguration(NeAACDecHandle hDecoder,
                                                    NeAACDecConfigurationPtr config);
+
+/* Set the DRC compression level (one of FAAD_DRC_*). Takes effect on the
+   next decoded frame, so it can be changed at runtime between NeAACDecDecode
+   calls. Returns 1 on success, 0 on invalid arguments. The default level is
+   FAAD_DRC_HEAVY. Requires the library to be built with DRC application
+   enabled (CMake option FAAD_APPLY_DRC, ON by default); otherwise no DRC
+   gain is ever applied regardless of the level set here. */
+NEAACDECAPI unsigned char NeAACDecSetDRCLevel(NeAACDecHandle hDecoder,
+                                              unsigned char level);
+
+/* Get the current DRC compression level (one of FAAD_DRC_*). */
+NEAACDECAPI unsigned char NeAACDecGetDRCLevel(NeAACDecHandle hDecoder);
+
+/* Get the DRC gains that were effectively applied while decoding the most
+   recent frame. Returns 1 on success, 0 on invalid arguments. */
+NEAACDECAPI unsigned char NeAACDecGetDRCFrameInfo(NeAACDecHandle hDecoder,
+                                                  NeAACDecDRCFrameInfo *info);
 
 /* Init the library based on info from the AAC file (ADTS/ADIF) */
 NEAACDECAPI long NeAACDecInit(NeAACDecHandle hDecoder,

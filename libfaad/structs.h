@@ -98,6 +98,11 @@ typedef struct
 
     real_t ctrl1;
     real_t ctrl2;
+
+    /* runtime DRC compression level (FAAD_DRC_*), see neaacdec.h */
+    uint8_t level;
+    /* linear gain factor applied per band in the last decoded frame */
+    double band_gain[17];
 } drc_info;
 
 typedef struct

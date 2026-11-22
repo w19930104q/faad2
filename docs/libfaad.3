@@ -26,6 +26,18 @@ libfaad \- C library for AAC Decoding
 .BI "NeAACDecHandle " "hDecoder" ", NeAACDecConfigurationPtr " config ");"
 
 .HP
+.B "unsigned char NEAACDECAPI NeAACDecSetDRCLevel("
+.BI "NeAACDecHandle " "hDecoder" ", unsigned char " level ");"
+
+.HP
+.B "unsigned char NEAACDECAPI NeAACDecGetDRCLevel("
+.BI "NeAACDecHandle " hDecoder ");"
+
+.HP
+.B "unsigned char NEAACDECAPI NeAACDecGetDRCFrameInfo("
+.BI "NeAACDecHandle " "hDecoder" ", NeAACDecDRCFrameInfo *" info ");"
+
+.HP
 /* Init the library based on info from the AAC file (ADTS/ADIF) */
 .B "long NEAACDECAPI NeAACDecInit("
 .BI "NeAACDecHandle " hDecoder ", unsigned char *" buffer ", unsigned long " "buffer_size" ","
@@ -129,6 +141,55 @@ Sets a new configuration structure for the decoder library.
 .PP
 Return values:
 .PP 0 \[en] Error, invalid configuration.
+.PP 1 \[en] OK
+.PP
+.B NeAACDecSetDRCLevel
+.PP unsigned char NEAACAPI NeAACDecSetDRCLevel(NeAACDecHandle hDecoder, unsigned char level);
+.PP
+Sets the DRC (dynamic range control) compression level. The level takes
+effect on the next decoded frame, so it can be changed at runtime
+between NeAACDecDecode calls. The default level is FAAD_DRC_HEAVY.
+Requires the library to be built with DRC application enabled (CMake
+option FAAD_APPLY_DRC, ON by default).
+.PP
+The following levels are defined:
+.PP
+#define FAAD_DRC_OFF \  \ 0 /* DRC not applied; output is bit-exact identical to a zero-gain reference decode */
+.PP
+#define FAAD_DRC_LIGHT 1 /* half compression: dyn_rng_ctl scaled by 1/2 */
+.PP
+#define FAAD_DRC_HEAVY 2 /* full compression (default, historical behaviour) */
+.PP
+Return values:
+.PP 0 \[en] Error, invalid arguments.
+.PP 1 \[en] OK
+.PP
+.B NeAACDecGetDRCLevel
+.PP unsigned char NEAACAPI NeAACDecGetDRCLevel(NeAACDecHandle hDecoder);
+.PP
+Returns the current DRC compression level (one of FAAD_DRC_*).
+.PP
+.B NeAACDecGetDRCFrameInfo
+.PP unsigned char NEAACAPI NeAACDecGetDRCFrameInfo(NeAACDecHandle hDecoder, NeAACDecDRCFrameInfo *info);
+.PP
+Reports the DRC gains that were effectively applied while decoding the
+most recent frame. The NeAACDecDRCFrameInfo structure contains the
+presence flag, the level in effect, the number of signalled DRC bands
+and the linear gain factor applied per band (1.0 where no gain was
+applied).
+.PP
+The DRC gain is applied per channel in the spectral domain, after TNS
+decoding and before the IMDCT filter bank. Downmixing (downMatrix) is
+performed later, in the time domain on the filter bank output. DRC
+therefore always runs before downmixing: each channel is gained
+independently first, and the downmix matrix combines the already-gained
+channels.
+.PP
+See docs/drc.md for the exact gain formula per level and further
+details.
+.PP
+Return values:
+.PP 0 \[en] Error, invalid arguments.
 .PP 1 \[en] OK
 .PP
 .B NeAACDecInit

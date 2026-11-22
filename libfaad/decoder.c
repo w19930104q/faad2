@@ -237,6 +237,47 @@ unsigned char NeAACDecSetConfiguration(NeAACDecHandle hpDecoder,
 }
 
 
+unsigned char NeAACDecSetDRCLevel(NeAACDecHandle hpDecoder, unsigned char level)
+{
+    NeAACDecStruct* hDecoder = (NeAACDecStruct*)hpDecoder;
+    if ((hDecoder == NULL) || (hDecoder->drc == NULL))
+        return 0;
+    if (level > FAAD_DRC_HEAVY)
+        return 0;
+
+    /* takes effect on the next decoded frame */
+    hDecoder->drc->level = (uint8_t)level;
+    return 1;
+}
+
+unsigned char NeAACDecGetDRCLevel(NeAACDecHandle hpDecoder)
+{
+    NeAACDecStruct* hDecoder = (NeAACDecStruct*)hpDecoder;
+    if ((hDecoder == NULL) || (hDecoder->drc == NULL))
+        return 0;
+
+    return hDecoder->drc->level;
+}
+
+unsigned char NeAACDecGetDRCFrameInfo(NeAACDecHandle hpDecoder,
+                                      NeAACDecDRCFrameInfo *info)
+{
+    NeAACDecStruct* hDecoder = (NeAACDecStruct*)hpDecoder;
+    uint8_t bd;
+
+    if ((hDecoder == NULL) || (hDecoder->drc == NULL) || (info == NULL))
+        return 0;
+
+    info->present = hDecoder->drc->present;
+    info->level = hDecoder->drc->level;
+    info->num_bands = hDecoder->drc->present ? hDecoder->drc->num_bands : 0;
+    for (bd = 0; bd < 17; bd++)
+        info->gain[bd] = hDecoder->drc->band_gain[bd];
+
+    return 1;
+}
+
+
 #if 0
 static int latmCheck(latm_header *latm, bitfile *ld)
 {
@@ -879,6 +920,15 @@ static void* aac_frame_decode(NeAACDecStruct *hDecoder,
 
     memset(hInfo, 0, sizeof(NeAACDecFrameInfo));
     memset(hDecoder->internal_channel, 0, MAX_CHANNELS*sizeof(hDecoder->internal_channel[0]));
+
+    /* per-frame DRC gains are (re)computed during reconstruction below;
+       reset so that NeAACDecGetDRCFrameInfo() never reports stale values */
+    if (hDecoder->drc)
+    {
+        uint8_t bd;
+        for (bd = 0; bd < 17; bd++)
+            hDecoder->drc->band_gain[bd] = 1.0;
+    }
 
 #ifdef USE_TIME_LIMIT
     if ((TIME_LIMIT * get_sample_rate(hDecoder->sf_index)) > hDecoder->TL_count)

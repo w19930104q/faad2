@@ -265,6 +265,23 @@ if (FAAD_BUILD_CLI)
     set_target_properties(faad_cli PROPERTIES OUTPUT_NAME faad)
   endif()
 endif()
+
+# Tests
+option(FAAD_BUILD_TESTS "Build libfaad tests" OFF)
+if (FAAD_BUILD_TESTS)
+  enable_testing()
+  add_executable(test_drc tests/test_drc.c)
+  target_link_libraries(test_drc faad)
+  add_executable(test_drc_fixed tests/test_drc.c)
+  target_link_libraries(test_drc_fixed faad_fixed)
+  target_compile_definitions(test_drc_fixed PRIVATE FAAD_TEST_FIXED)
+  if (NOT FAAD_APPLY_DRC)
+    target_compile_definitions(test_drc PRIVATE FAAD_TEST_NO_DRC)
+    target_compile_definitions(test_drc_fixed PRIVATE FAAD_TEST_NO_DRC)
+  endif()
+  add_test(NAME drc COMMAND test_drc)
+  add_test(NAME drc_fixed COMMAND test_drc_fixed)
+endif()
 # Installation
 
 if(NOT FAAD_BUNDLED_MODE)
